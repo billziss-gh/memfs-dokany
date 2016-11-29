@@ -1427,8 +1427,8 @@ NTSTATUS MemfsRun(MEMFS *Memfs, PWSTR Mountpoint, PWSTR UncName)
         Options.ThreadCount = 2;
     Options.GlobalContext = (UINT_PTR)Memfs;
     Options.MountPoint = Mountpoint;
-    Options.UNCName = UncName;
-    Options.Timeout = 60000;
+    Options.UNCName = 0;//UncName;
+    Options.Timeout = 600000;
     Options.AllocationUnitSize = MEMFS_SECTOR_SIZE * MEMFS_SECTORS_PER_ALLOCATION_UNIT;
     Options.SectorSize = MEMFS_SECTOR_SIZE;
 
