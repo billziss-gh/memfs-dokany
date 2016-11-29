@@ -579,16 +579,16 @@ static NTSTATUS Create(PDOKAN_FILE_INFO DokanFileInfo,
     PVOID *PFileNode, BY_HANDLE_FILE_INFORMATION *FileInfo)
 {
     MEMFS *Memfs = (MEMFS *)(UINT_PTR)DokanFileInfo->DokanOptions->GlobalContext;
-#if defined(MEMFS_NAME_NORMALIZATION)
-    WCHAR FileNameBuf[MAX_PATH];
-#endif
     MEMFS_FILE_NODE *FileNode;
     MEMFS_FILE_NODE *ParentNode;
     NTSTATUS Result;
     BOOLEAN Inserted;
 
     if (CreateOptions & FILE_DIRECTORY_FILE)
+    {
+        FileAttributes |= FILE_ATTRIBUTE_DIRECTORY;
         AllocationSize = 0;
+    }
 
     FileNode = MemfsFileNodeMapGet(Memfs->FileNodeMap, FileName);
     if (0 != FileNode)
@@ -603,31 +603,6 @@ static NTSTATUS Create(PDOKAN_FILE_INFO DokanFileInfo,
 
     if (AllocationSize > Memfs->MaxFileSize)
         return STATUS_DISK_FULL;
-
-#if defined(MEMFS_NAME_NORMALIZATION)
-    if (MemfsFileNodeMapIsCaseInsensitive(Memfs->FileNodeMap))
-    {
-        WCHAR Root[2] = L"\\";
-        PWSTR Remain, Suffix;
-        size_t RemainLength, BSlashLength, SuffixLength;
-
-        FspPathSuffix(FileName, &Remain, &Suffix, Root);
-        assert(0 == MemfsCompareString(Remain, -1, ParentNode->FileName, -1, TRUE));
-        FspPathCombine(FileName, Suffix);
-
-        RemainLength = wcslen(ParentNode->FileName);
-        BSlashLength = 1 < RemainLength;
-        SuffixLength = wcslen(Suffix);
-        if (MAX_PATH <= RemainLength + BSlashLength + SuffixLength)
-            return STATUS_OBJECT_NAME_INVALID;
-
-        memcpy(FileNameBuf, ParentNode->FileName, RemainLength * sizeof(WCHAR));
-        memcpy(FileNameBuf + RemainLength, L"\\", BSlashLength * sizeof(WCHAR));
-        memcpy(FileNameBuf + RemainLength + BSlashLength, Suffix, (SuffixLength + 1) * sizeof(WCHAR));
-
-        FileName = FileNameBuf;
-    }
-#endif
 
     Result = MemfsFileNodeCreate(FileName, &FileNode);
     if (!NT_SUCCESS(Result))
@@ -678,17 +653,6 @@ static NTSTATUS Create(PDOKAN_FILE_INFO DokanFileInfo,
     *PFileNode = FileNode;
     MemfsFileNodeGetFileInfo(FileNode, FileInfo);
 
-#if defined(MEMFS_NAME_NORMALIZATION)
-    if (MemfsFileNodeMapIsCaseInsensitive(Memfs->FileNodeMap))
-    {
-        FSP_FSCTL_OPEN_FILE_INFO *OpenFileInfo = FspFileSystemGetOpenFileInfo(FileInfo);
-
-        wcscpy_s(OpenFileInfo->NormalizedName, OpenFileInfo->NormalizedNameSize / sizeof(WCHAR),
-            FileNode->FileName);
-        OpenFileInfo->NormalizedNameSize = (UINT16)(wcslen(FileNode->FileName) * sizeof(WCHAR));
-    }
-#endif
-
     return STATUS_SUCCESS;
 }
 
@@ -726,17 +690,6 @@ static NTSTATUS Open(PDOKAN_FILE_INFO DokanFileInfo,
     FileNode->RefCount++;
     *PFileNode = FileNode;
     MemfsFileNodeGetFileInfo(FileNode, FileInfo);
-
-#if defined(MEMFS_NAME_NORMALIZATION)
-    if (MemfsFileNodeMapIsCaseInsensitive(Memfs->FileNodeMap))
-    {
-        FSP_FSCTL_OPEN_FILE_INFO *OpenFileInfo = FspFileSystemGetOpenFileInfo(FileInfo);
-
-        wcscpy_s(OpenFileInfo->NormalizedName, OpenFileInfo->NormalizedNameSize / sizeof(WCHAR),
-            FileNode->FileName);
-        OpenFileInfo->NormalizedNameSize = (UINT16)(wcslen(FileNode->FileName) * sizeof(WCHAR));
-    }
-#endif
 
     return STATUS_SUCCESS;
 }
@@ -810,8 +763,7 @@ NTSTATUS DOKAN_CALLBACK MyCreateFile(LPCWSTR FileName0,
         Result = Open(DokanFileInfo,
             FileName, CreateOptions, DesiredAccess, &FileNode, &FileInfo);
         if (NT_SUCCESS(Result))
-            Result = Overwrite(DokanFileInfo, FileNode, FileAttributes,
-                FILE_SUPERSEDE == CreateDisposition, &FileInfo);
+            Result = Overwrite(DokanFileInfo, FileNode, FileAttributes, FALSE, &FileInfo);
         else if (STATUS_OBJECT_NAME_NOT_FOUND == Result)
             Result = Create(DokanFileInfo,
                 FileName, CreateOptions, DesiredAccess, FileAttributes, 0, 0, &FileNode, &FileInfo);
@@ -1017,7 +969,7 @@ NTSTATUS DOKAN_CALLBACK MySetEndOfFile(LPCWSTR FileName,
         {
             AllocationSize = (NewSize + AllocationUnit - 1) / AllocationUnit * AllocationUnit;
 
-            NTSTATUS Result = MySetAllocationSize(FileName, NewSize, DokanFileInfo);
+            NTSTATUS Result = MySetAllocationSize(FileName, AllocationSize, DokanFileInfo);
             if (!NT_SUCCESS(Result))
                 return Result;
         }
@@ -1040,6 +992,8 @@ NTSTATUS DOKAN_CALLBACK MySetAllocationSize(LPCWSTR FileName,
     UINT64 AllocationUnit = MEMFS_SECTOR_SIZE * MEMFS_SECTORS_PER_ALLOCATION_UNIT;
     LONGLONG AllocationSize = (FileNode->FileInfo.nFileSizeLow + AllocationUnit - 1) /
         AllocationUnit * AllocationUnit;
+
+    NewSize = (NewSize + AllocationUnit - 1) / AllocationUnit * AllocationUnit;
 
     if (AllocationSize != NewSize)
     {
@@ -1445,6 +1399,8 @@ NTSTATUS MemfsCreate(
         return Result;
     }
 
+    *PMemfs = Memfs;
+
     return STATUS_SUCCESS;
 }
 
@@ -1630,12 +1586,16 @@ int wmain(int argc, wchar_t **argv)
     if (0 != argp[0])
         usage();
 
+    if (0 == MountPoint)
+        usage();
+
+    warn("%s -n %ld -s %ld% -m %S",
+        PROGNAME, MaxFileNodes, MaxFileSize, MountPoint);
+
     Result = MemfsCreate(Flags, MaxFileNodes, MaxFileSize, &Memfs);
     if (!NT_SUCCESS(Result))
         fail("error: cannot create MEMFS: Status=%#lx", Result);
 
-    warn("%s --n %ld -s %ld% -m %S",
-        PROGNAME, MaxFileNodes, MaxFileSize, MountPoint);
     SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
 
     Result = MemfsRun(Memfs, MountPoint, 0/*unused*/);
