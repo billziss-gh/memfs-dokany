@@ -28,7 +28,9 @@
 #define MEMFS_SECTOR_SIZE               512
 #define MEMFS_SECTORS_PER_ALLOCATION_UNIT 1
 
-/* Path Support */
+/*
+ * Path Support
+ */
 VOID FspPathPrefix(PWSTR Path, PWSTR *PPrefix, PWSTR *PRemain, PWSTR Root)
 {
     PWSTR Pointer;
@@ -82,7 +84,9 @@ VOID FspPathCombine(PWSTR Prefix, PWSTR Suffix)
             *Prefix = L'\\';
 }
 
-/* Large Heap Support */
+/*
+ * Large Heap Support
+ */
 typedef struct
 {
     DWORD Options;
@@ -147,6 +151,10 @@ VOID LargeHeapFree(PVOID Pointer)
     if (0 != Pointer)
         HeapFree(LargeHeap, 0, Pointer);
 }
+
+/*
+ * MEMFS
+ */
 
 static inline
 FILETIME MemfsGetSystemTime(VOID)
@@ -233,6 +241,7 @@ typedef struct _MEMFS
     MEMFS_FILE_NODE_MAP *FileNodeMap;
     ULONG MaxFileNodes;
     ULONG MaxFileSize;
+    SRWLOCK Lock;
 } MEMFS;
 
 static inline
@@ -492,9 +501,33 @@ BOOLEAN MemfsFileNodeMapEnumerateDescendants(MEMFS_FILE_NODE_MAP *FileNodeMap, M
     return TRUE;
 }
 
+struct MemfsLockGuard
+{
+    MemfsLockGuard(MEMFS *Memfs, BOOLEAN Exclusive) : _Memfs(Memfs), _Exclusive(Exclusive)
+    {
+        if (_Exclusive)
+            AcquireSRWLockExclusive(&_Memfs->Lock);
+        else
+            AcquireSRWLockShared(&_Memfs->Lock);
+    }
+    ~MemfsLockGuard()
+    {
+        if (_Exclusive)
+            ReleaseSRWLockExclusive(&_Memfs->Lock);
+        else
+            ReleaseSRWLockShared(&_Memfs->Lock);
+    }
+private:
+    MEMFS *_Memfs;
+    BOOLEAN _Exclusive;
+};
+
 /*
  * DOKAN_OPERATIONS
  */
+
+#define LOCK_GUARD(DokanFileInfo, Exclusive)\
+    MemfsLockGuard LockGuard((MEMFS *)(UINT_PTR)(DokanFileInfo)->DokanOptions->GlobalContext, Exclusive)
 
 NTSTATUS DOKAN_CALLBACK MySetEndOfFile(LPCWSTR FileName,
     LONGLONG NewSize,
@@ -739,6 +772,8 @@ NTSTATUS DOKAN_CALLBACK MyCreateFile(LPCWSTR FileName0,
     ULONG CreateOptions,
     PDOKAN_FILE_INFO DokanFileInfo)
 {
+    LOCK_GUARD(DokanFileInfo, TRUE);
+
     NTSTATUS Result;
     WCHAR FileName[MAX_PATH];
     PVOID FileNode;
@@ -812,10 +847,15 @@ static BOOLEAN CleanupEnumFn(MEMFS_FILE_NODE *FileNode, PVOID Context0)
 void DOKAN_CALLBACK MyCleanup(LPCWSTR FileName,
     PDOKAN_FILE_INFO DokanFileInfo)
 {
+    if (!DokanFileInfo->DeleteOnClose)
+        return;
+
+    LOCK_GUARD(DokanFileInfo, TRUE);
+
     MEMFS *Memfs = (MEMFS *)(UINT_PTR)DokanFileInfo->DokanOptions->GlobalContext;
     MEMFS_FILE_NODE *FileNode = (MEMFS_FILE_NODE *)(UINT_PTR)DokanFileInfo->Context;
 
-    if (DokanFileInfo->DeleteOnClose && !MemfsFileNodeMapHasChild(Memfs->FileNodeMap, FileNode))
+    if (!MemfsFileNodeMapHasChild(Memfs->FileNodeMap, FileNode))
     {
 #if defined(MEMFS_NAMED_STREAMS)
         MEMFS_CLEANUP_CONTEXT Context = { 0 };
@@ -1034,6 +1074,8 @@ static NTSTATUS CanDelete(PDOKAN_FILE_INFO DokanFileInfo,
 NTSTATUS DOKAN_CALLBACK MyDeleteFile(LPCWSTR FileName0,
     PDOKAN_FILE_INFO DokanFileInfo)
 {
+    LOCK_GUARD(DokanFileInfo, FALSE);
+
     MEMFS_FILE_NODE *FileNode = (MEMFS_FILE_NODE *)(UINT_PTR)DokanFileInfo->Context;
     WCHAR FileName[MAX_PATH];
 
@@ -1045,6 +1087,8 @@ NTSTATUS DOKAN_CALLBACK MyDeleteFile(LPCWSTR FileName0,
 NTSTATUS DOKAN_CALLBACK MyDeleteDirectory(LPCWSTR FileName0,
     PDOKAN_FILE_INFO DokanFileInfo)
 {
+    LOCK_GUARD(DokanFileInfo, FALSE);
+
     MEMFS_FILE_NODE *FileNode = (MEMFS_FILE_NODE *)(UINT_PTR)DokanFileInfo->Context;
     WCHAR FileName[MAX_PATH];
 
@@ -1074,6 +1118,8 @@ NTSTATUS DOKAN_CALLBACK MyMoveFile(LPCWSTR FileName,
     BOOL ReplaceIfExists,
     PDOKAN_FILE_INFO DokanFileInfo)
 {
+    LOCK_GUARD(DokanFileInfo, TRUE);
+
     MEMFS *Memfs = (MEMFS *)(UINT_PTR)DokanFileInfo->DokanOptions->GlobalContext;
     MEMFS_FILE_NODE *FileNode = (MEMFS_FILE_NODE *)(UINT_PTR)DokanFileInfo->Context;
     MEMFS_FILE_NODE *NewFileNode, *DescendantFileNode;
@@ -1205,6 +1251,8 @@ NTSTATUS DOKAN_CALLBACK MyFindFiles(LPCWSTR FileName,
     PFillFindData FillFindData,
     PDOKAN_FILE_INFO DokanFileInfo)
 {
+    LOCK_GUARD(DokanFileInfo, TRUE);
+
     MEMFS *Memfs = (MEMFS *)(UINT_PTR)DokanFileInfo->DokanOptions->GlobalContext;
     MEMFS_FILE_NODE *FileNode = (MEMFS_FILE_NODE *)(UINT_PTR)DokanFileInfo->Context;
     MEMFS_FILE_NODE *ParentNode;
@@ -1367,6 +1415,7 @@ NTSTATUS MemfsCreate(
     Memfs->MaxFileNodes = MaxFileNodes;
     AllocationUnit = MEMFS_SECTOR_SIZE * MEMFS_SECTORS_PER_ALLOCATION_UNIT;
     Memfs->MaxFileSize = (ULONG)((MaxFileSize + AllocationUnit - 1) / AllocationUnit * AllocationUnit);
+    InitializeSRWLock(&Memfs->Lock);
 
     Result = MemfsFileNodeMapCreate(CaseInsensitive, &Memfs->FileNodeMap);
     if (!NT_SUCCESS(Result))
