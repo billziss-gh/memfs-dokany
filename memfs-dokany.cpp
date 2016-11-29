@@ -12,34 +12,75 @@
  * http://choosealicense.com/no-license/
  */
 
-#if 0
-#undef _DEBUG
-#include "memfs.h"
-#include <sddl.h>
+#include "memfs-dokany.h"
 #include <map>
 #include <cassert>
-#include <VersionHelpers.h>
+
+#define NT_SUCCESS(Status)              (((NTSTATUS)(Status)) >= 0)
 
 /*
  * Define the MEMFS_NAMED_STREAMS macro to include named streams support.
+ *
+ * NOTE: INCOMPLETE FOR MEMFS-DOKANY.
  */
-#define MEMFS_NAMED_STREAMS
-
-/*
- * Define the MEMFS_NAME_NORMALIZATION macro to include name normalization support.
- */
-#define MEMFS_NAME_NORMALIZATION
-
-/*
- * Define the DEBUG_BUFFER_CHECK macro on Windows 8 or above. This includes
- * a check for the Write buffer to ensure that it is read-only.
- */
-#if !defined(NDEBUG)
-#define DEBUG_BUFFER_CHECK
-#endif
+//#define MEMFS_NAMED_STREAMS
 
 #define MEMFS_SECTOR_SIZE               512
 #define MEMFS_SECTORS_PER_ALLOCATION_UNIT 1
+
+/* Path Support */
+VOID FspPathPrefix(PWSTR Path, PWSTR *PPrefix, PWSTR *PRemain, PWSTR Root)
+{
+    PWSTR Pointer;
+
+    for (Pointer = Path; *Pointer; Pointer++)
+        if (L'\\' == *Pointer)
+        {
+            if (0 != Root && Path == Pointer)
+                Path = Root;
+            *Pointer++ = L'\0';
+            for (; L'\\' == *Pointer; Pointer++)
+                ;
+            break;
+        }
+
+    *PPrefix = Path;
+    *PRemain = Pointer;
+}
+
+VOID FspPathSuffix(PWSTR Path, PWSTR *PRemain, PWSTR *PSuffix, PWSTR Root)
+{
+    PWSTR Pointer, RemainEnd = 0, Suffix = 0;
+
+    for (Pointer = Path; *Pointer;)
+        if (L'\\' == *Pointer)
+        {
+            RemainEnd = Pointer++;
+            for (; L'\\' == *Pointer; Pointer++)
+                ;
+            Suffix = Pointer;
+        }
+        else
+            Pointer++;
+
+    *PRemain = Path;
+    if (Path < Suffix)
+    {
+        if (0 != Root && Path == RemainEnd && L'\\' == *Path)
+            *PRemain = Root;
+        *RemainEnd = L'\0';
+        *PSuffix = Suffix;
+    }
+    else
+        *PSuffix = Pointer;
+}
+
+VOID FspPathCombine(PWSTR Prefix, PWSTR Suffix)
+{
+    for (; Prefix < Suffix; Prefix++)
+        if (L'\0' == *Prefix)
+            *Prefix = L'\\';
+}
 
 /* Large Heap Support */
 typedef struct
@@ -108,11 +149,11 @@ VOID LargeHeapFree(PVOID Pointer)
 }
 
 static inline
-UINT64 MemfsGetSystemTime(VOID)
+FILETIME MemfsGetSystemTime(VOID)
 {
     FILETIME FileTime;
     GetSystemTimeAsFileTime(&FileTime);
-    return ((PLARGE_INTEGER)&FileTime)->QuadPart;
+    return FileTime;
 }
 
 static inline
@@ -163,12 +204,10 @@ BOOLEAN MemfsFileNameHasPrefix(PWSTR a, PWSTR b, BOOLEAN CaseInsensitive)
 typedef struct _MEMFS_FILE_NODE
 {
     WCHAR FileName[MAX_PATH];
-    FSP_FSCTL_FILE_INFO FileInfo;
+    BY_HANDLE_FILE_INFORMATION FileInfo;
     SIZE_T FileSecuritySize;
     PVOID FileSecurity;
     PVOID FileData;
-    SIZE_T ReparseDataSize;
-    PVOID ReparseData;
     ULONG RefCount;
 #if defined(MEMFS_NAMED_STREAMS)
     struct _MEMFS_FILE_NODE *MainFileNode;
@@ -190,7 +229,7 @@ typedef std::map<PWSTR, MEMFS_FILE_NODE *, MEMFS_FILE_NODE_LESS> MEMFS_FILE_NODE
 
 typedef struct _MEMFS
 {
-    FSP_FILE_SYSTEM *FileSystem;
+    //FSP_FILE_SYSTEM *FileSystem;
     MEMFS_FILE_NODE_MAP *FileNodeMap;
     ULONG MaxFileNodes;
     ULONG MaxFileSize;
@@ -203,6 +242,7 @@ NTSTATUS MemfsFileNodeCreate(PWSTR FileName, MEMFS_FILE_NODE **PFileNode)
 {
     static UINT64 IndexNumber = 1;
     MEMFS_FILE_NODE *FileNode;
+    LARGE_INTEGER FileIndexNumber;
 
     *PFileNode = 0;
 
@@ -213,13 +253,15 @@ NTSTATUS MemfsFileNodeCreate(PWSTR FileName, MEMFS_FILE_NODE **PFileNode)
     if (0 == FileNode)
         return STATUS_INSUFFICIENT_RESOURCES;
 
+    FileIndexNumber.QuadPart = IndexNumber++;
     memset(FileNode, 0, sizeof *FileNode);
     wcscpy_s(FileNode->FileName, sizeof FileNode->FileName / sizeof(WCHAR), FileName);
-    FileNode->FileInfo.CreationTime =
-    FileNode->FileInfo.LastAccessTime =
-    FileNode->FileInfo.LastWriteTime =
-    FileNode->FileInfo.ChangeTime = MemfsGetSystemTime();
-    FileNode->FileInfo.IndexNumber = IndexNumber++;
+    FileNode->FileInfo.ftCreationTime =
+    FileNode->FileInfo.ftLastAccessTime =
+    FileNode->FileInfo.ftLastWriteTime = MemfsGetSystemTime();
+    FileNode->FileInfo.nNumberOfLinks = 1;
+    FileNode->FileInfo.nFileIndexLow = FileIndexNumber.LowPart;
+    FileNode->FileInfo.nFileIndexHigh = FileIndexNumber.HighPart;
 
     *PFileNode = FileNode;
 
@@ -229,14 +271,13 @@ NTSTATUS MemfsFileNodeCreate(PWSTR FileName, MEMFS_FILE_NODE **PFileNode)
 static inline
 VOID MemfsFileNodeDelete(MEMFS_FILE_NODE *FileNode)
 {
-    free(FileNode->ReparseData);
     LargeHeapFree(FileNode->FileData);
     free(FileNode->FileSecurity);
     free(FileNode);
 }
 
 static inline
-VOID MemfsFileNodeGetFileInfo(MEMFS_FILE_NODE *FileNode, FSP_FSCTL_FILE_INFO *FileInfo)
+VOID MemfsFileNodeGetFileInfo(MEMFS_FILE_NODE *FileNode, BY_HANDLE_FILE_INFORMATION *FileInfo)
 {
 #if defined(MEMFS_NAMED_STREAMS)
     if (0 == FileNode->MainFileNode)
@@ -244,25 +285,14 @@ VOID MemfsFileNodeGetFileInfo(MEMFS_FILE_NODE *FileNode, FSP_FSCTL_FILE_INFO *Fi
     else
     {
         *FileInfo = FileNode->MainFileNode->FileInfo;
-        FileInfo->FileAttributes &= ~FILE_ATTRIBUTE_DIRECTORY;
+        FileInfo->dwFileAttributes &= ~FILE_ATTRIBUTE_DIRECTORY;
             /* named streams cannot be directories */
-        FileInfo->AllocationSize = FileNode->FileInfo.AllocationSize;
-        FileInfo->FileSize = FileNode->FileInfo.FileSize;
+        FileInfo->nFileSizeHigh = FileNode->FileInfo.nFileSizeHigh;
+        FileInfo->nFileSizeLow = FileNode->FileInfo.nFileSizeLow;
     }
 #else
     *FileInfo = FileNode->FileInfo;
 #endif
-}
-
-static inline
-VOID MemfsFileNodeMapDump(MEMFS_FILE_NODE_MAP *FileNodeMap)
-{
-    for (MEMFS_FILE_NODE_MAP::iterator p = FileNodeMap->begin(), q = FileNodeMap->end(); p != q; ++p)
-        FspDebugLog("%c %04lx %6lu %S\n",
-            FILE_ATTRIBUTE_DIRECTORY & p->second->FileInfo.FileAttributes ? 'd' : 'f',
-            (ULONG)p->second->FileInfo.FileAttributes,
-            (ULONG)p->second->FileInfo.FileSize,
-            p->second->FileName);
 }
 
 static inline
@@ -343,7 +373,7 @@ MEMFS_FILE_NODE *MemfsFileNodeMapGetParent(MEMFS_FILE_NODE_MAP *FileNodeMap, PWS
         *PResult = STATUS_OBJECT_PATH_NOT_FOUND;
         return 0;
     }
-    if (0 == (iter->second->FileInfo.FileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+    if (0 == (iter->second->FileInfo.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
     {
         *PResult = STATUS_NOT_A_DIRECTORY;
         return 0;
@@ -464,107 +494,60 @@ BOOLEAN MemfsFileNodeMapEnumerateDescendants(MEMFS_FILE_NODE_MAP *FileNodeMap, M
     return TRUE;
 }
 
-static NTSTATUS GetReparsePointByName(
-    FSP_FILE_SYSTEM *FileSystem, PVOID Context,
-    PWSTR FileName, BOOLEAN IsDirectory, PVOID Buffer, PSIZE_T PSize);
+/*
+ * DOKAN_OPERATIONS
+ */
 
-static NTSTATUS SetFileSize(FSP_FILE_SYSTEM *FileSystem,
-    PVOID FileNode0, UINT64 NewSize, BOOLEAN SetAllocationSize,
-    FSP_FSCTL_FILE_INFO *FileInfo);
+NTSTATUS DOKAN_CALLBACK MySetEndOfFile(LPCWSTR FileName,
+    LONGLONG NewSize,
+    PDOKAN_FILE_INFO DokanFileInfo);
+NTSTATUS DOKAN_CALLBACK MySetAllocationSize(LPCWSTR FileName,
+    LONGLONG NewSize,
+    PDOKAN_FILE_INFO DokanFileInfo);
 
-static NTSTATUS GetVolumeInfo(FSP_FILE_SYSTEM *FileSystem,
-    FSP_FSCTL_VOLUME_INFO *VolumeInfo)
+NTSTATUS DOKAN_CALLBACK MyGetDiskFreeSpace(PULONGLONG FreeBytesAvailable,
+    PULONGLONG TotalNumberOfBytes,
+    PULONGLONG TotalNumberOfFreeBytes,
+    PDOKAN_FILE_INFO DokanFileInfo)
 {
-    MEMFS *Memfs = (MEMFS *)FileSystem->UserContext;
+    MEMFS *Memfs = (MEMFS *)(UINT_PTR)DokanFileInfo->DokanOptions->GlobalContext;
 
-    VolumeInfo->TotalSize = Memfs->MaxFileNodes * (UINT64)Memfs->MaxFileSize;
-    VolumeInfo->FreeSize = (Memfs->MaxFileNodes - MemfsFileNodeMapCount(Memfs->FileNodeMap)) *
-        (UINT64)Memfs->MaxFileSize;
-    VolumeInfo->VolumeLabelLength = Memfs->VolumeLabelLength;
-    memcpy(VolumeInfo->VolumeLabel, Memfs->VolumeLabel, Memfs->VolumeLabelLength);
+    *TotalNumberOfBytes = Memfs->MaxFileNodes * (UINT64)Memfs->MaxFileSize;
+    *FreeBytesAvailable = *TotalNumberOfFreeBytes =
+        (Memfs->MaxFileNodes - MemfsFileNodeMapCount(Memfs->FileNodeMap)) * (UINT64)Memfs->MaxFileSize;
 
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS SetVolumeLabel(FSP_FILE_SYSTEM *FileSystem,
-    PWSTR VolumeLabel,
-    FSP_FSCTL_VOLUME_INFO *VolumeInfo)
+NTSTATUS DOKAN_CALLBACK MyGetVolumeInformation(LPWSTR VolumeNameBuffer,
+    DWORD VolumeNameSize,
+    LPDWORD VolumeSerialNumber,
+    LPDWORD MaximumComponentLength,
+    LPDWORD FileSystemFlags,
+    LPWSTR FileSystemNameBuffer,
+    DWORD FileSystemNameSize,
+    PDOKAN_FILE_INFO DokanFileInfo)
 {
-    MEMFS *Memfs = (MEMFS *)FileSystem->UserContext;
+    MEMFS *Memfs = (MEMFS *)(UINT_PTR)DokanFileInfo->DokanOptions->GlobalContext;
 
-    Memfs->VolumeLabelLength = (UINT16)(wcslen(VolumeLabel) * sizeof(WCHAR));
-    if (Memfs->VolumeLabelLength > sizeof Memfs->VolumeLabel)
-        Memfs->VolumeLabelLength = sizeof Memfs->VolumeLabel;
-    memcpy(Memfs->VolumeLabel, VolumeLabel, Memfs->VolumeLabelLength);
-
-    VolumeInfo->TotalSize = Memfs->MaxFileNodes * Memfs->MaxFileSize;
-    VolumeInfo->FreeSize =
-        (Memfs->MaxFileNodes - MemfsFileNodeMapCount(Memfs->FileNodeMap)) * Memfs->MaxFileSize;
-    VolumeInfo->VolumeLabelLength = Memfs->VolumeLabelLength;
-    memcpy(VolumeInfo->VolumeLabel, Memfs->VolumeLabel, Memfs->VolumeLabelLength);
+    VolumeNameBuffer[0] = L'\0';
+    *VolumeSerialNumber = 0;
+    *MaximumComponentLength = 255;
+    *FileSystemFlags =
+        FILE_CASE_SENSITIVE_SEARCH |
+        FILE_CASE_PRESERVED_NAMES |
+        FILE_UNICODE_ON_DISK;
+    FileSystemNameBuffer[0] = L'\0';
 
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS GetSecurityByName(FSP_FILE_SYSTEM *FileSystem,
-    PWSTR FileName, PUINT32 PFileAttributes,
-    PSECURITY_DESCRIPTOR SecurityDescriptor, SIZE_T *PSecurityDescriptorSize)
-{
-    MEMFS *Memfs = (MEMFS *)FileSystem->UserContext;
-    MEMFS_FILE_NODE *FileNode;
-    NTSTATUS Result;
-
-    FileNode = MemfsFileNodeMapGet(Memfs->FileNodeMap, FileName);
-    if (0 == FileNode)
-    {
-        Result = STATUS_OBJECT_NAME_NOT_FOUND;
-
-        if (FspFileSystemFindReparsePoint(FileSystem, GetReparsePointByName, 0,
-            FileName, PFileAttributes))
-            Result = STATUS_REPARSE;
-        else
-            MemfsFileNodeMapGetParent(Memfs->FileNodeMap, FileName, &Result);
-
-        return Result;
-    }
-
-#if defined(MEMFS_NAMED_STREAMS)
-    UINT32 FileAttributesMask = ~(UINT32)0;
-    if (0 != FileNode->MainFileNode)
-    {
-        FileAttributesMask = ~(UINT32)FILE_ATTRIBUTE_DIRECTORY;
-        FileNode = FileNode->MainFileNode;
-    }
-
-    if (0 != PFileAttributes)
-        *PFileAttributes = FileNode->FileInfo.FileAttributes & FileAttributesMask;
-#else
-    if (0 != PFileAttributes)
-        *PFileAttributes = FileNode->FileInfo.FileAttributes;
-#endif
-
-    if (0 != PSecurityDescriptorSize)
-    {
-        if (FileNode->FileSecuritySize > *PSecurityDescriptorSize)
-        {
-            *PSecurityDescriptorSize = FileNode->FileSecuritySize;
-            return STATUS_BUFFER_OVERFLOW;
-        }
-
-        *PSecurityDescriptorSize = FileNode->FileSecuritySize;
-        if (0 != SecurityDescriptor)
-            memcpy(SecurityDescriptor, FileNode->FileSecurity, FileNode->FileSecuritySize);
-    }
-
-    return STATUS_SUCCESS;
-}
-
-static NTSTATUS Create(FSP_FILE_SYSTEM *FileSystem,
+static NTSTATUS Create(PDOKAN_FILE_INFO DokanFileInfo,
     PWSTR FileName, UINT32 CreateOptions, UINT32 GrantedAccess,
     UINT32 FileAttributes, PSECURITY_DESCRIPTOR SecurityDescriptor, UINT64 AllocationSize,
-    PVOID *PFileNode, FSP_FSCTL_FILE_INFO *FileInfo)
+    PVOID *PFileNode, BY_HANDLE_FILE_INFORMATION *FileInfo)
 {
-    MEMFS *Memfs = (MEMFS *)FileSystem->UserContext;
+    MEMFS *Memfs = (MEMFS *)(UINT_PTR)DokanFileInfo->DokanOptions->GlobalContext;
 #if defined(MEMFS_NAME_NORMALIZATION)
     WCHAR FileNameBuf[MAX_PATH];
 #endif
@@ -623,7 +606,7 @@ static NTSTATUS Create(FSP_FILE_SYSTEM *FileSystem,
     FileNode->MainFileNode = MemfsFileNodeMapGetMain(Memfs->FileNodeMap, FileName);
 #endif
 
-    FileNode->FileInfo.FileAttributes = (FileAttributes & FILE_ATTRIBUTE_DIRECTORY) ?
+    FileNode->FileInfo.dwFileAttributes = (FileAttributes & FILE_ATTRIBUTE_DIRECTORY) ?
         FileAttributes : FileAttributes | FILE_ATTRIBUTE_ARCHIVE;
 
     if (0 != SecurityDescriptor)
@@ -638,6 +621,7 @@ static NTSTATUS Create(FSP_FILE_SYSTEM *FileSystem,
         memcpy(FileNode->FileSecurity, SecurityDescriptor, FileNode->FileSecuritySize);
     }
 
+#if 0
     FileNode->FileInfo.AllocationSize = AllocationSize;
     if (0 != FileNode->FileInfo.AllocationSize)
     {
@@ -648,6 +632,7 @@ static NTSTATUS Create(FSP_FILE_SYSTEM *FileSystem,
             return STATUS_INSUFFICIENT_RESOURCES;
         }
     }
+#endif
 
     Result = MemfsFileNodeMapInsert(Memfs->FileNodeMap, FileNode, &Inserted);
     if (!NT_SUCCESS(Result) || !Inserted)
@@ -676,11 +661,11 @@ static NTSTATUS Create(FSP_FILE_SYSTEM *FileSystem,
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS Open(FSP_FILE_SYSTEM *FileSystem,
+static NTSTATUS Open(PDOKAN_FILE_INFO DokanFileInfo,
     PWSTR FileName, UINT32 CreateOptions, UINT32 GrantedAccess,
-    PVOID *PFileNode, FSP_FSCTL_FILE_INFO *FileInfo)
+    PVOID *PFileNode, BY_HANDLE_FILE_INFORMATION *FileInfo)
 {
-    MEMFS *Memfs = (MEMFS *)FileSystem->UserContext;
+    MEMFS *Memfs = (MEMFS *)(UINT_PTR)DokanFileInfo->DokanOptions->GlobalContext;
     MEMFS_FILE_NODE *FileNode;
     NTSTATUS Result;
 
@@ -703,9 +688,9 @@ static NTSTATUS Open(FSP_FILE_SYSTEM *FileSystem,
      *
      * TBD.
      */
-    if (0 == (FileNode->FileInfo.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+    if (0 == (FileNode->FileInfo.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
         (GrantedAccess & (FILE_WRITE_DATA | FILE_APPEND_DATA)))
-        FileNode->FileInfo.FileAttributes |= FILE_ATTRIBUTE_ARCHIVE;
+        FileNode->FileInfo.dwFileAttributes |= FILE_ATTRIBUTE_ARCHIVE;
 
     FileNode->RefCount++;
     *PFileNode = FileNode;
@@ -725,25 +710,88 @@ static NTSTATUS Open(FSP_FILE_SYSTEM *FileSystem,
     return STATUS_SUCCESS;
 }
 
-NTSTATUS Overwrite(FSP_FILE_SYSTEM *FileSystem,
+static NTSTATUS Overwrite(PDOKAN_FILE_INFO DokanFileInfo,
     PVOID FileNode0, UINT32 FileAttributes, BOOLEAN ReplaceFileAttributes,
-    FSP_FSCTL_FILE_INFO *FileInfo)
+    BY_HANDLE_FILE_INFORMATION *FileInfo)
 {
-    MEMFS *Memfs = (MEMFS *)FileSystem->UserContext;
+    MEMFS *Memfs = (MEMFS *)(UINT_PTR)DokanFileInfo->DokanOptions->GlobalContext;
     MEMFS_FILE_NODE *FileNode = (MEMFS_FILE_NODE *)FileNode0;
 
     if (ReplaceFileAttributes)
-        FileNode->FileInfo.FileAttributes = FileAttributes | FILE_ATTRIBUTE_ARCHIVE;
+        FileNode->FileInfo.dwFileAttributes = FileAttributes | FILE_ATTRIBUTE_ARCHIVE;
     else
-        FileNode->FileInfo.FileAttributes |= FileAttributes | FILE_ATTRIBUTE_ARCHIVE;
+        FileNode->FileInfo.dwFileAttributes |= FileAttributes | FILE_ATTRIBUTE_ARCHIVE;
 
-    FileNode->FileInfo.FileSize = 0;
-    FileNode->FileInfo.LastWriteTime =
-    FileNode->FileInfo.LastAccessTime = MemfsGetSystemTime();
+    FileNode->FileInfo.nFileSizeHigh =
+    FileNode->FileInfo.nFileSizeLow = 0;
+    FileNode->FileInfo.ftLastWriteTime =
+    FileNode->FileInfo.ftLastAccessTime = MemfsGetSystemTime();
 
     MemfsFileNodeGetFileInfo(FileNode, FileInfo);
 
     return STATUS_SUCCESS;
+}
+
+NTSTATUS DOKAN_CALLBACK MyCreateFile(LPCWSTR FileName0,
+    PDOKAN_IO_SECURITY_CONTEXT SecurityContext,
+    ACCESS_MASK DesiredAccess,
+    ULONG FileAttributes,
+    ULONG ShareAccess,
+    ULONG CreateDisposition,
+    ULONG CreateOptions,
+    PDOKAN_FILE_INFO DokanFileInfo)
+{
+    NTSTATUS Result;
+    WCHAR FileName[MAX_PATH];
+    PVOID FileNode;
+    BY_HANDLE_FILE_INFORMATION FileInfo;
+
+    wcscpy_s(FileName, sizeof FileName / sizeof(WCHAR), FileName0);
+
+    switch (CreateDisposition)
+    {
+    case FILE_CREATE:
+        Result = Create(DokanFileInfo,
+            FileName, CreateOptions, DesiredAccess, FileAttributes, 0, 0, &FileNode, &FileInfo);
+        break;
+    case FILE_OPEN:
+        Result = Open(DokanFileInfo,
+            FileName, CreateOptions, DesiredAccess, &FileNode, &FileInfo);
+        break;
+    case FILE_OPEN_IF:
+        Result = Open(DokanFileInfo,
+            FileName, CreateOptions, DesiredAccess, &FileNode, &FileInfo);
+        if (STATUS_OBJECT_NAME_NOT_FOUND == Result)
+            Result = Create(DokanFileInfo,
+                FileName, CreateOptions, DesiredAccess, FileAttributes, 0, 0, &FileNode, &FileInfo);
+        break;
+    case FILE_OVERWRITE:
+    case FILE_SUPERSEDE:
+        Result = Open(DokanFileInfo,
+            FileName, CreateOptions, DesiredAccess, &FileNode, &FileInfo);
+        if (NT_SUCCESS(Result))
+            Result = Overwrite(DokanFileInfo, FileNode, FileAttributes,
+                FILE_SUPERSEDE == CreateDisposition, &FileInfo);
+        break;
+    case FILE_OVERWRITE_IF:
+        Result = Open(DokanFileInfo,
+            FileName, CreateOptions, DesiredAccess, &FileNode, &FileInfo);
+        if (NT_SUCCESS(Result))
+            Result = Overwrite(DokanFileInfo, FileNode, FileAttributes,
+                FILE_SUPERSEDE == CreateDisposition, &FileInfo);
+        else if (STATUS_OBJECT_NAME_NOT_FOUND == Result)
+            Result = Create(DokanFileInfo,
+                FileName, CreateOptions, DesiredAccess, FileAttributes, 0, 0, &FileNode, &FileInfo);
+        break;
+    default:
+        Result = STATUS_INVALID_PARAMETER;
+        break;
+    }
+
+    if (NT_SUCCESS(Result))
+        DokanFileInfo->Context = (UINT_PTR)FileNode;
+
+    return Result;
 }
 
 #if defined(MEMFS_NAMED_STREAMS)
@@ -763,15 +811,13 @@ static BOOLEAN CleanupEnumFn(MEMFS_FILE_NODE *FileNode, PVOID Context0)
 }
 #endif
 
-static VOID Cleanup(FSP_FILE_SYSTEM *FileSystem,
-    PVOID FileNode0, PWSTR FileName, BOOLEAN Delete)
+void DOKAN_CALLBACK MyCleanup(LPCWSTR FileName,
+    PDOKAN_FILE_INFO DokanFileInfo)
 {
-    MEMFS *Memfs = (MEMFS *)FileSystem->UserContext;
-    MEMFS_FILE_NODE *FileNode = (MEMFS_FILE_NODE *)FileNode0;
+    MEMFS *Memfs = (MEMFS *)(UINT_PTR)DokanFileInfo->DokanOptions->GlobalContext;
+    MEMFS_FILE_NODE *FileNode = (MEMFS_FILE_NODE *)(UINT_PTR)DokanFileInfo->Context;
 
-    assert(Delete); /* the new FSP_FSCTL_VOLUME_PARAMS::PostCleanupOnDeleteOnly ensures this */
-
-    if (Delete && !MemfsFileNodeMapHasChild(Memfs->FileNodeMap, FileNode))
+    if (DokanFileInfo->DeleteOnClose && !MemfsFileNodeMapHasChild(Memfs->FileNodeMap, FileNode))
     {
 #if defined(MEMFS_NAMED_STREAMS)
         MEMFS_CLEANUP_CONTEXT Context = { 0 };
@@ -791,29 +837,32 @@ static VOID Cleanup(FSP_FILE_SYSTEM *FileSystem,
     }
 }
 
-static VOID Close(FSP_FILE_SYSTEM *FileSystem,
-    PVOID FileNode0)
+void DOKAN_CALLBACK MyCloseFile(LPCWSTR FileName,
+    PDOKAN_FILE_INFO DokanFileInfo)
 {
-    MEMFS *Memfs = (MEMFS *)FileSystem->UserContext;
-    MEMFS_FILE_NODE *FileNode = (MEMFS_FILE_NODE *)FileNode0;
+    MEMFS *Memfs = (MEMFS *)(UINT_PTR)DokanFileInfo->DokanOptions->GlobalContext;
+    MEMFS_FILE_NODE *FileNode = (MEMFS_FILE_NODE *)(UINT_PTR)DokanFileInfo->Context;
 
     if (0 == --FileNode->RefCount)
         MemfsFileNodeDelete(FileNode);
 }
 
-static NTSTATUS Read(FSP_FILE_SYSTEM *FileSystem,
-    PVOID FileNode0, PVOID Buffer, UINT64 Offset, ULONG Length,
-    PULONG PBytesTransferred)
+NTSTATUS DOKAN_CALLBACK MyReadFile(LPCWSTR FileName,
+    LPVOID Buffer,
+    DWORD Length,
+    LPDWORD PBytesTransferred,
+    LONGLONG Offset,
+    PDOKAN_FILE_INFO DokanFileInfo)
 {
-    MEMFS_FILE_NODE *FileNode = (MEMFS_FILE_NODE *)FileNode0;
+    MEMFS_FILE_NODE *FileNode = (MEMFS_FILE_NODE *)(UINT_PTR)DokanFileInfo->Context;
     UINT64 EndOffset;
 
-    if (Offset >= FileNode->FileInfo.FileSize)
+    if (Offset >= FileNode->FileInfo.nFileSizeLow)
         return STATUS_END_OF_FILE;
 
     EndOffset = Offset + Length;
-    if (EndOffset > FileNode->FileInfo.FileSize)
-        EndOffset = FileNode->FileInfo.FileSize;
+    if (EndOffset > FileNode->FileInfo.nFileSizeLow)
+        EndOffset = FileNode->FileInfo.nFileSizeLow;
 
     memcpy(Buffer, (PUINT8)FileNode->FileData + Offset, (size_t)(EndOffset - Offset));
 
@@ -822,79 +871,63 @@ static NTSTATUS Read(FSP_FILE_SYSTEM *FileSystem,
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS Write(FSP_FILE_SYSTEM *FileSystem,
-    PVOID FileNode0, PVOID Buffer, UINT64 Offset, ULONG Length,
-    BOOLEAN WriteToEndOfFile, BOOLEAN ConstrainedIo,
-    PULONG PBytesTransferred, FSP_FSCTL_FILE_INFO *FileInfo)
+NTSTATUS DOKAN_CALLBACK MyWriteFile(LPCWSTR FileName,
+    LPCVOID Buffer,
+    DWORD Length,
+    LPDWORD PBytesTransferred,
+    LONGLONG Offset,
+    PDOKAN_FILE_INFO DokanFileInfo)
 {
-#if defined(DEBUG_BUFFER_CHECK)
-    SYSTEM_INFO SystemInfo;
-    GetSystemInfo(&SystemInfo);
-    for (PUINT8 P = (PUINT8)Buffer, EndP = P + Length; EndP > P; P += SystemInfo.dwPageSize)
-        __try
-        {
-            *P = *P | 0;
-            assert(!IsWindows8OrGreater());
-                /* only on Windows 8 we can make the buffer read-only! */
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            /* ignore! */
-        }
-#endif
-
-    MEMFS_FILE_NODE *FileNode = (MEMFS_FILE_NODE *)FileNode0;
+    MEMFS_FILE_NODE *FileNode = (MEMFS_FILE_NODE *)(UINT_PTR)DokanFileInfo->Context;
     UINT64 EndOffset;
 
-    if (ConstrainedIo)
+    if (DokanFileInfo->PagingIo)
     {
-        if (Offset >= FileNode->FileInfo.FileSize)
+        if (Offset >= FileNode->FileInfo.nFileSizeLow)
             return STATUS_SUCCESS;
         EndOffset = Offset + Length;
-        if (EndOffset > FileNode->FileInfo.FileSize)
-            EndOffset = FileNode->FileInfo.FileSize;
+        if (EndOffset > FileNode->FileInfo.nFileSizeLow)
+            EndOffset = FileNode->FileInfo.nFileSizeLow;
     }
     else
     {
-        if (WriteToEndOfFile)
-            Offset = FileNode->FileInfo.FileSize;
+        if (DokanFileInfo->WriteToEndOfFile)
+            Offset = FileNode->FileInfo.nFileSizeLow;
         EndOffset = Offset + Length;
-        if (EndOffset > FileNode->FileInfo.FileSize)
-            SetFileSize(FileSystem, FileNode, EndOffset, FALSE, FileInfo);
+        if (EndOffset > FileNode->FileInfo.nFileSizeLow)
+            MySetEndOfFile(FileName, EndOffset, DokanFileInfo);
     }
 
     memcpy((PUINT8)FileNode->FileData + Offset, Buffer, (size_t)(EndOffset - Offset));
 
     *PBytesTransferred = (ULONG)(EndOffset - Offset);
-    MemfsFileNodeGetFileInfo(FileNode, FileInfo);
 
     return STATUS_SUCCESS;
 }
 
-NTSTATUS Flush(FSP_FILE_SYSTEM *FileSystem,
-    PVOID FileNode)
+NTSTATUS DOKAN_CALLBACK MyFlushFileBuffers(LPCWSTR FileName,
+    PDOKAN_FILE_INFO DokanFileInfo)
 {
     /* nothing to do, since we do not cache anything */
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS GetFileInfo(FSP_FILE_SYSTEM *FileSystem,
-    PVOID FileNode0,
-    FSP_FSCTL_FILE_INFO *FileInfo)
+NTSTATUS DOKAN_CALLBACK MyGetFileInformation(LPCWSTR FileName,
+    LPBY_HANDLE_FILE_INFORMATION FileInfo,
+    PDOKAN_FILE_INFO DokanFileInfo)
 {
-    MEMFS_FILE_NODE *FileNode = (MEMFS_FILE_NODE *)FileNode0;
+    MEMFS_FILE_NODE *FileNode = (MEMFS_FILE_NODE *)(UINT_PTR)DokanFileInfo->Context;
 
     MemfsFileNodeGetFileInfo(FileNode, FileInfo);
 
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS SetBasicInfo(FSP_FILE_SYSTEM *FileSystem,
-    PVOID FileNode0, UINT32 FileAttributes,
-    UINT64 CreationTime, UINT64 LastAccessTime, UINT64 LastWriteTime,
-    FSP_FSCTL_FILE_INFO *FileInfo)
+NTSTATUS DOKAN_CALLBACK MySetFileAttributes(LPCWSTR FileName,
+    DWORD FileAttributes,
+    PDOKAN_FILE_INFO DokanFileInfo)
 {
-    MEMFS_FILE_NODE *FileNode = (MEMFS_FILE_NODE *)FileNode0;
+    MEMFS_FILE_NODE *FileNode = (MEMFS_FILE_NODE *)(UINT_PTR)DokanFileInfo->Context;
 
 #if defined(MEMFS_NAMED_STREAMS)
     if (0 != FileNode->MainFileNode)
@@ -902,81 +935,124 @@ static NTSTATUS SetBasicInfo(FSP_FILE_SYSTEM *FileSystem,
 #endif
 
     if (INVALID_FILE_ATTRIBUTES != FileAttributes)
-        FileNode->FileInfo.FileAttributes = FileAttributes;
-    if (0 != CreationTime)
-        FileNode->FileInfo.CreationTime = CreationTime;
-    if (0 != LastAccessTime)
-        FileNode->FileInfo.LastAccessTime = LastAccessTime;
-    if (0 != LastWriteTime)
-        FileNode->FileInfo.LastWriteTime = LastWriteTime;
-
-    MemfsFileNodeGetFileInfo(FileNode, FileInfo);
+        FileNode->FileInfo.dwFileAttributes = FileAttributes;
 
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS SetFileSize(FSP_FILE_SYSTEM *FileSystem,
-    PVOID FileNode0, UINT64 NewSize, BOOLEAN SetAllocationSize,
-    FSP_FSCTL_FILE_INFO *FileInfo)
+NTSTATUS DOKAN_CALLBACK MySetFileTime(LPCWSTR FileName,
+    CONST FILETIME *CreationTime,
+    CONST FILETIME *LastAccessTime,
+    CONST FILETIME *LastWriteTime,
+    PDOKAN_FILE_INFO DokanFileInfo)
 {
-    MEMFS *Memfs = (MEMFS *)FileSystem->UserContext;
-    MEMFS_FILE_NODE *FileNode = (MEMFS_FILE_NODE *)FileNode0;
+    MEMFS_FILE_NODE *FileNode = (MEMFS_FILE_NODE *)(UINT_PTR)DokanFileInfo->Context;
 
-    if (SetAllocationSize)
-    {
-        if (FileNode->FileInfo.AllocationSize != NewSize)
-        {
-            if (NewSize > Memfs->MaxFileSize)
-                return STATUS_DISK_FULL;
+#if defined(MEMFS_NAMED_STREAMS)
+    if (0 != FileNode->MainFileNode)
+        FileNode = FileNode->MainFileNode;
+#endif
 
-            PVOID FileData = LargeHeapRealloc(FileNode->FileData, (size_t)NewSize);
-            if (0 == FileData && 0 != NewSize)
-                return STATUS_INSUFFICIENT_RESOURCES;
-
-            FileNode->FileData = FileData;
-
-            FileNode->FileInfo.AllocationSize = NewSize;
-            if (FileNode->FileInfo.FileSize > NewSize)
-                FileNode->FileInfo.FileSize = NewSize;
-        }
-    }
-    else
-    {
-        if (FileNode->FileInfo.FileSize != NewSize)
-        {
-            if (FileNode->FileInfo.AllocationSize < NewSize)
-            {
-                UINT64 AllocationUnit = MEMFS_SECTOR_SIZE * MEMFS_SECTORS_PER_ALLOCATION_UNIT;
-                UINT64 AllocationSize = (NewSize + AllocationUnit - 1) / AllocationUnit * AllocationUnit;
-
-                NTSTATUS Result = SetFileSize(FileSystem, FileNode, AllocationSize, TRUE,
-                    FileInfo);
-                if (!NT_SUCCESS(Result))
-                    return Result;
-            }
-
-            if (FileNode->FileInfo.FileSize < NewSize)
-                memset((PUINT8)FileNode->FileData + FileNode->FileInfo.FileSize, 0,
-                    (size_t)(NewSize - FileNode->FileInfo.FileSize));
-            FileNode->FileInfo.FileSize = NewSize;
-        }
-    }
-
-    MemfsFileNodeGetFileInfo(FileNode, FileInfo);
+    if (0 != CreationTime)
+        FileNode->FileInfo.ftCreationTime = *CreationTime;
+    if (0 != LastAccessTime)
+        FileNode->FileInfo.ftLastAccessTime = *LastAccessTime;
+    if (0 != LastWriteTime)
+        FileNode->FileInfo.ftLastWriteTime = *LastWriteTime;
 
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS CanDelete(FSP_FILE_SYSTEM *FileSystem,
+NTSTATUS DOKAN_CALLBACK MySetEndOfFile(LPCWSTR FileName,
+    LONGLONG NewSize,
+    PDOKAN_FILE_INFO DokanFileInfo)
+{
+    MEMFS *Memfs = (MEMFS *)(UINT_PTR)DokanFileInfo->DokanOptions->GlobalContext;
+    MEMFS_FILE_NODE *FileNode = (MEMFS_FILE_NODE *)(UINT_PTR)DokanFileInfo->Context;
+    UINT64 AllocationUnit = MEMFS_SECTOR_SIZE * MEMFS_SECTORS_PER_ALLOCATION_UNIT;
+    LONGLONG AllocationSize = (FileNode->FileInfo.nFileSizeLow + AllocationUnit - 1) /
+        AllocationUnit * AllocationUnit;
+
+    if (FileNode->FileInfo.nFileSizeLow != NewSize)
+    {
+        if (AllocationSize < NewSize)
+        {
+            AllocationSize = (NewSize + AllocationUnit - 1) / AllocationUnit * AllocationUnit;
+
+            NTSTATUS Result = MySetAllocationSize(FileName, NewSize, DokanFileInfo);
+            if (!NT_SUCCESS(Result))
+                return Result;
+        }
+
+        if (FileNode->FileInfo.nFileSizeLow < NewSize)
+            memset((PUINT8)FileNode->FileData + FileNode->FileInfo.nFileSizeLow, 0,
+                (size_t)(NewSize - FileNode->FileInfo.nFileSizeLow));
+        FileNode->FileInfo.nFileSizeLow = (DWORD)NewSize;
+    }
+
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS DOKAN_CALLBACK MySetAllocationSize(LPCWSTR FileName,
+    LONGLONG NewSize,
+    PDOKAN_FILE_INFO DokanFileInfo)
+{
+    MEMFS *Memfs = (MEMFS *)(UINT_PTR)DokanFileInfo->DokanOptions->GlobalContext;
+    MEMFS_FILE_NODE *FileNode = (MEMFS_FILE_NODE *)(UINT_PTR)DokanFileInfo->Context;
+    UINT64 AllocationUnit = MEMFS_SECTOR_SIZE * MEMFS_SECTORS_PER_ALLOCATION_UNIT;
+    LONGLONG AllocationSize = (FileNode->FileInfo.nFileSizeLow + AllocationUnit - 1) /
+        AllocationUnit * AllocationUnit;
+
+    if (AllocationSize != NewSize)
+    {
+        if (NewSize > Memfs->MaxFileSize)
+            return STATUS_DISK_FULL;
+
+        PVOID FileData = LargeHeapRealloc(FileNode->FileData, (size_t)NewSize);
+        if (0 == FileData && 0 != NewSize)
+            return STATUS_INSUFFICIENT_RESOURCES;
+
+        FileNode->FileData = FileData;
+
+        if (FileNode->FileInfo.nFileSizeLow > NewSize)
+            FileNode->FileInfo.nFileSizeLow = (DWORD)NewSize;
+    }
+
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS CanDelete(PDOKAN_FILE_INFO DokanFileInfo,
     PVOID FileNode0, PWSTR FileName)
 {
-    MEMFS *Memfs = (MEMFS *)FileSystem->UserContext;
+    MEMFS *Memfs = (MEMFS *)(UINT_PTR)DokanFileInfo->DokanOptions->GlobalContext;
     MEMFS_FILE_NODE *FileNode = (MEMFS_FILE_NODE *)FileNode0;
 
     if (MemfsFileNodeMapHasChild(Memfs->FileNodeMap, FileNode))
         return STATUS_DIRECTORY_NOT_EMPTY;
 
     return STATUS_SUCCESS;
+}
+
+NTSTATUS DOKAN_CALLBACK MyDeleteFile(LPCWSTR FileName0,
+    PDOKAN_FILE_INFO DokanFileInfo)
+{
+    MEMFS_FILE_NODE *FileNode = (MEMFS_FILE_NODE *)(UINT_PTR)DokanFileInfo->Context;
+    WCHAR FileName[MAX_PATH];
+
+    wcscpy_s(FileName, sizeof FileName / sizeof(WCHAR), FileName0);
+
+    return CanDelete(DokanFileInfo, FileNode, FileName);
+}
+
+NTSTATUS DOKAN_CALLBACK MyDeleteDirectory(LPCWSTR FileName0,
+    PDOKAN_FILE_INFO DokanFileInfo)
+{
+    MEMFS_FILE_NODE *FileNode = (MEMFS_FILE_NODE *)(UINT_PTR)DokanFileInfo->Context;
+    WCHAR FileName[MAX_PATH];
+
+    wcscpy_s(FileName, sizeof FileName / sizeof(WCHAR), FileName0);
+
+    return CanDelete(DokanFileInfo, FileNode, FileName);
 }
 
 typedef struct _MEMFS_RENAME_CONTEXT
@@ -995,17 +1071,21 @@ static BOOLEAN RenameEnumFn(MEMFS_FILE_NODE *FileNode, PVOID Context0)
     return TRUE;
 }
 
-static NTSTATUS Rename(FSP_FILE_SYSTEM *FileSystem,
-    PVOID FileNode0,
-    PWSTR FileName, PWSTR NewFileName, BOOLEAN ReplaceIfExists)
+NTSTATUS DOKAN_CALLBACK MyMoveFile(LPCWSTR FileName,
+    LPCWSTR NewFileName0,
+    BOOL ReplaceIfExists,
+    PDOKAN_FILE_INFO DokanFileInfo)
 {
-    MEMFS *Memfs = (MEMFS *)FileSystem->UserContext;
-    MEMFS_FILE_NODE *FileNode = (MEMFS_FILE_NODE *)FileNode0;
+    MEMFS *Memfs = (MEMFS *)(UINT_PTR)DokanFileInfo->DokanOptions->GlobalContext;
+    MEMFS_FILE_NODE *FileNode = (MEMFS_FILE_NODE *)(UINT_PTR)DokanFileInfo->Context;
     MEMFS_FILE_NODE *NewFileNode, *DescendantFileNode;
     MEMFS_RENAME_CONTEXT Context = { 0 };
     ULONG Index, FileNameLen, NewFileNameLen;
     BOOLEAN Inserted;
     NTSTATUS Result;
+    WCHAR NewFileName[MAX_PATH];
+
+    wcscpy_s(NewFileName, sizeof NewFileName / sizeof(WCHAR), NewFileName0);
 
     NewFileNode = MemfsFileNodeMapGet(Memfs->FileNodeMap, NewFileName);
     if (0 != NewFileNode && FileNode != NewFileNode)
@@ -1016,7 +1096,7 @@ static NTSTATUS Rename(FSP_FILE_SYSTEM *FileSystem,
             goto exit;
         }
 
-        if (NewFileNode->FileInfo.FileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+        if (NewFileNode->FileInfo.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
         {
             Result = STATUS_ACCESS_DENIED;
             goto exit;
@@ -1063,7 +1143,7 @@ static NTSTATUS Rename(FSP_FILE_SYSTEM *FileSystem,
         Result = MemfsFileNodeMapInsert(Memfs->FileNodeMap, DescendantFileNode, &Inserted);
         if (!NT_SUCCESS(Result))
         {
-            FspDebugLog(__FUNCTION__ ": cannot insert into FileNodeMap; aborting\n");
+            OutputDebugStringA(__FUNCTION__ ": cannot insert into FileNodeMap; aborting\n");
             abort();
         }
         assert(Inserted);
@@ -1082,85 +1162,17 @@ exit:
     return Result;
 }
 
-static NTSTATUS GetSecurity(FSP_FILE_SYSTEM *FileSystem,
-    PVOID FileNode0,
-    PSECURITY_DESCRIPTOR SecurityDescriptor, SIZE_T *PSecurityDescriptorSize)
-{
-    MEMFS_FILE_NODE *FileNode = (MEMFS_FILE_NODE *)FileNode0;
-
-#if defined(MEMFS_NAMED_STREAMS)
-    if (0 != FileNode->MainFileNode)
-        FileNode = FileNode->MainFileNode;
-#endif
-
-    if (FileNode->FileSecuritySize > *PSecurityDescriptorSize)
-    {
-        *PSecurityDescriptorSize = FileNode->FileSecuritySize;
-        return STATUS_BUFFER_OVERFLOW;
-    }
-
-    *PSecurityDescriptorSize = FileNode->FileSecuritySize;
-    if (0 != SecurityDescriptor)
-        memcpy(SecurityDescriptor, FileNode->FileSecurity, FileNode->FileSecuritySize);
-
-    return STATUS_SUCCESS;
-}
-
-static NTSTATUS SetSecurity(FSP_FILE_SYSTEM *FileSystem,
-    PVOID FileNode0,
-    SECURITY_INFORMATION SecurityInformation, PSECURITY_DESCRIPTOR ModificationDescriptor,
-    HANDLE AccessToken)
-{
-    MEMFS_FILE_NODE *FileNode = (MEMFS_FILE_NODE *)FileNode0;
-    PSECURITY_DESCRIPTOR NewSecurityDescriptor, FileSecurity;
-    SIZE_T FileSecuritySize;
-    NTSTATUS Result;
-
-#if defined(MEMFS_NAMED_STREAMS)
-    if (0 != FileNode->MainFileNode)
-        FileNode = FileNode->MainFileNode;
-#endif
-
-    Result = FspSetSecurityDescriptor(
-        FileNode->FileSecurity,
-        SecurityInformation,
-        ModificationDescriptor,
-        AccessToken,
-        &NewSecurityDescriptor);
-    if (!NT_SUCCESS(Result))
-        return Result;
-
-    FileSecuritySize = GetSecurityDescriptorLength(NewSecurityDescriptor);
-    FileSecurity = (PSECURITY_DESCRIPTOR)malloc(FileSecuritySize);
-    if (0 == FileSecurity)
-    {
-        FspDeleteSecurityDescriptor(NewSecurityDescriptor, (NTSTATUS (*)())FspSetSecurityDescriptor);
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-    memcpy(FileSecurity, NewSecurityDescriptor, FileSecuritySize);
-    FspDeleteSecurityDescriptor(NewSecurityDescriptor, (NTSTATUS (*)())FspSetSecurityDescriptor);
-
-    free(FileNode->FileSecurity);
-    FileNode->FileSecuritySize = FileSecuritySize;
-    FileNode->FileSecurity = FileSecurity;
-
-    return STATUS_SUCCESS;
-}
-
 typedef struct _MEMFS_READ_DIRECTORY_CONTEXT
 {
-    PVOID Buffer;
-    UINT64 Offset;
-    ULONG Length;
-    PULONG PBytesTransferred;
-    BOOLEAN OffsetFound;
+    PFillFindData FillFindData;
+    PDOKAN_FILE_INFO DokanFileInfo;
 } MEMFS_READ_DIRECTORY_CONTEXT;
 
 static BOOLEAN AddDirInfo(MEMFS_FILE_NODE *FileNode, PWSTR FileName,
-    PVOID Buffer, ULONG Length, PULONG PBytesTransferred)
+    PFillFindData FillFindData,
+    PDOKAN_FILE_INFO DokanFileInfo)
 {
-    UINT8 DirInfoBuf[sizeof(FSP_FSCTL_DIR_INFO) + sizeof FileNode->FileName];
-    FSP_FSCTL_DIR_INFO *DirInfo = (FSP_FSCTL_DIR_INFO *)DirInfoBuf;
+    WIN32_FIND_DATAW DirInfo;
     WCHAR Root[2] = L"\\";
     PWSTR Remain, Suffix;
 
@@ -1171,36 +1183,32 @@ static BOOLEAN AddDirInfo(MEMFS_FILE_NODE *FileNode, PWSTR FileName,
         FspPathCombine(FileNode->FileName, Suffix);
     }
 
-    memset(DirInfo->Padding, 0, sizeof DirInfo->Padding);
-    DirInfo->Size = (UINT16)(sizeof(FSP_FSCTL_DIR_INFO) + wcslen(FileName) * sizeof(WCHAR));
-    DirInfo->FileInfo = FileNode->FileInfo;
-    DirInfo->NextOffset = FileNode->FileInfo.IndexNumber;
-    memcpy(DirInfo->FileNameBuf, FileName, DirInfo->Size - sizeof(FSP_FSCTL_DIR_INFO));
+    memset(&DirInfo, 0, sizeof DirInfo);
+    DirInfo.dwFileAttributes = FileNode->FileInfo.dwFileAttributes;
+    DirInfo.ftCreationTime = FileNode->FileInfo.ftCreationTime;
+    DirInfo.ftLastAccessTime = FileNode->FileInfo.ftLastAccessTime;
+    DirInfo.ftLastWriteTime = FileNode->FileInfo.ftLastWriteTime;
+    DirInfo.nFileSizeHigh = FileNode->FileInfo.nFileSizeHigh;
+    DirInfo.nFileSizeLow = FileNode->FileInfo.nFileSizeLow;
+    wcscpy_s(DirInfo.cFileName, sizeof DirInfo.cFileName / sizeof(WCHAR), FileName);
+    DirInfo.cAlternateFileName[0] = L'\0';
 
-    return FspFileSystemAddDirInfo(DirInfo, Buffer, Length, PBytesTransferred);
+    return 0 == FillFindData(&DirInfo, DokanFileInfo);
 }
 
 static BOOLEAN ReadDirectoryEnumFn(MEMFS_FILE_NODE *FileNode, PVOID Context0)
 {
     MEMFS_READ_DIRECTORY_CONTEXT *Context = (MEMFS_READ_DIRECTORY_CONTEXT *)Context0;
 
-    if (0 != Context->Offset && !Context->OffsetFound)
-    {
-        Context->OffsetFound = FileNode->FileInfo.IndexNumber == Context->Offset;
-        return TRUE;
-    }
-
-    return AddDirInfo(FileNode, 0,
-        Context->Buffer, Context->Length, Context->PBytesTransferred);
+    return AddDirInfo(FileNode, 0, Context->FillFindData, Context->DokanFileInfo);
 }
 
-static NTSTATUS ReadDirectory(FSP_FILE_SYSTEM *FileSystem,
-    PVOID FileNode0, PVOID Buffer, UINT64 Offset, ULONG Length,
-    PWSTR Pattern,
-    PULONG PBytesTransferred)
+NTSTATUS DOKAN_CALLBACK MyFindFiles(LPCWSTR FileName,
+    PFillFindData FillFindData,
+    PDOKAN_FILE_INFO DokanFileInfo)
 {
-    MEMFS *Memfs = (MEMFS *)FileSystem->UserContext;
-    MEMFS_FILE_NODE *FileNode = (MEMFS_FILE_NODE *)FileNode0;
+    MEMFS *Memfs = (MEMFS *)(UINT_PTR)DokanFileInfo->DokanOptions->GlobalContext;
+    MEMFS_FILE_NODE *FileNode = (MEMFS_FILE_NODE *)(UINT_PTR)DokanFileInfo->Context;
     MEMFS_FILE_NODE *ParentNode;
     MEMFS_READ_DIRECTORY_CONTEXT Context;
     NTSTATUS Result;
@@ -1209,266 +1217,179 @@ static NTSTATUS ReadDirectory(FSP_FILE_SYSTEM *FileSystem,
     if (0 == ParentNode)
         return Result;
 
-    Context.Buffer = Buffer;
-    Context.Offset = Offset;
-    Context.Length = Length;
-    Context.PBytesTransferred = PBytesTransferred;
-    Context.OffsetFound = FALSE;
+    Context.FillFindData = FillFindData;
+    Context.DokanFileInfo = DokanFileInfo;
 
     if (L'\0' != FileNode->FileName[1])
     {
-        /* if this is not the root directory add the dot entries */
-
-        if (0 == Offset)
-            if (!AddDirInfo(FileNode, L".", Buffer, Length, PBytesTransferred))
-                return STATUS_SUCCESS;
-        if (0 == Offset || FileNode->FileInfo.IndexNumber == Offset)
-        {
-            Context.OffsetFound = FileNode->FileInfo.IndexNumber == Context.Offset;
-
-            if (!AddDirInfo(ParentNode, L"..", Buffer, Length, PBytesTransferred))
-                return STATUS_SUCCESS;
-        }
+        if (!AddDirInfo(FileNode, L".", FillFindData, DokanFileInfo))
+            return STATUS_SUCCESS;
+        if (!AddDirInfo(ParentNode, L"..", FillFindData, DokanFileInfo))
+            return STATUS_SUCCESS;
     }
 
-    if (MemfsFileNodeMapEnumerateChildren(Memfs->FileNodeMap, FileNode, ReadDirectoryEnumFn, &Context))
-        FspFileSystemAddDirInfo(0, Buffer, Length, PBytesTransferred);
+    MemfsFileNodeMapEnumerateChildren(Memfs->FileNodeMap, FileNode, ReadDirectoryEnumFn, &Context);
 
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS ResolveReparsePoints(FSP_FILE_SYSTEM *FileSystem,
-    PWSTR FileName, UINT32 ReparsePointIndex, BOOLEAN ResolveLastPathComponent,
-    PIO_STATUS_BLOCK PIoStatus, PVOID Buffer, PSIZE_T PSize)
+#if 0
+NTSTATUS DOKAN_CALLBACK MyFindFilesWithPattern(LPCWSTR PathName,
+    LPCWSTR SearchPattern,
+    PFillFindData FillFindData,
+    PDOKAN_FILE_INFO DokanFileInfo)
 {
-    return FspFileSystemResolveReparsePoints(FileSystem, GetReparsePointByName, 0,
-        FileName, ReparsePointIndex, ResolveLastPathComponent,
-        PIoStatus, Buffer, PSize);
-}
-
-static NTSTATUS GetReparsePointByName(
-    FSP_FILE_SYSTEM *FileSystem, PVOID Context,
-    PWSTR FileName, BOOLEAN IsDirectory, PVOID Buffer, PSIZE_T PSize)
-{
-    MEMFS *Memfs = (MEMFS *)FileSystem->UserContext;
-    MEMFS_FILE_NODE *FileNode;
-
-#if defined(MEMFS_NAMED_STREAMS)
-    /* GetReparsePointByName will never receive a named stream */
-    assert(0 == wcschr(FileName, L':'));
-#endif
-
-    FileNode = MemfsFileNodeMapGet(Memfs->FileNodeMap, FileName);
-    if (0 == FileNode)
-        return STATUS_OBJECT_NAME_NOT_FOUND;
-
-    if (0 == (FileNode->FileInfo.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
-        return STATUS_NOT_A_REPARSE_POINT;
-
-    if (0 != Buffer)
-    {
-        if (FileNode->ReparseDataSize > *PSize)
-            return STATUS_BUFFER_TOO_SMALL;
-
-        *PSize = FileNode->ReparseDataSize;
-        memcpy(Buffer, FileNode->ReparseData, FileNode->ReparseDataSize);
-    }
-
-    return STATUS_SUCCESS;
-}
-
-static NTSTATUS GetReparsePoint(FSP_FILE_SYSTEM *FileSystem,
-    PVOID FileNode0,
-    PWSTR FileName, PVOID Buffer, PSIZE_T PSize)
-{
-    MEMFS_FILE_NODE *FileNode = (MEMFS_FILE_NODE *)FileNode0;
-
-#if defined(MEMFS_NAMED_STREAMS)
-    if (0 != FileNode->MainFileNode)
-        FileNode = FileNode->MainFileNode;
-#endif
-
-    if (0 == (FileNode->FileInfo.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
-        return STATUS_NOT_A_REPARSE_POINT;
-
-    if (FileNode->ReparseDataSize > *PSize)
-        return STATUS_BUFFER_TOO_SMALL;
-
-    *PSize = FileNode->ReparseDataSize;
-    memcpy(Buffer, FileNode->ReparseData, FileNode->ReparseDataSize);
-
-    return STATUS_SUCCESS;
-}
-
-static NTSTATUS SetReparsePoint(FSP_FILE_SYSTEM *FileSystem,
-    PVOID FileNode0,
-    PWSTR FileName, PVOID Buffer, SIZE_T Size)
-{
-    MEMFS *Memfs = (MEMFS *)FileSystem->UserContext;
-    MEMFS_FILE_NODE *FileNode = (MEMFS_FILE_NODE *)FileNode0;
-    PVOID ReparseData;
-    NTSTATUS Result;
-
-#if defined(MEMFS_NAMED_STREAMS)
-    if (0 != FileNode->MainFileNode)
-        FileNode = FileNode->MainFileNode;
-#endif
-
-    if (MemfsFileNodeMapHasChild(Memfs->FileNodeMap, FileNode))
-        return STATUS_DIRECTORY_NOT_EMPTY;
-
-    if (0 != FileNode->ReparseData)
-    {
-        Result = FspFileSystemCanReplaceReparsePoint(
-            FileNode->ReparseData, FileNode->ReparseDataSize,
-            Buffer, Size);
-        if (!NT_SUCCESS(Result))
-            return Result;
-    }
-
-    ReparseData = realloc(FileNode->ReparseData, Size);
-    if (0 == ReparseData && 0 != Size)
-        return STATUS_INSUFFICIENT_RESOURCES;
-
-    FileNode->FileInfo.FileAttributes |= FILE_ATTRIBUTE_REPARSE_POINT;
-    FileNode->FileInfo.ReparseTag = *(PULONG)Buffer;
-        /* the first field in a reparse buffer is the reparse tag */
-    FileNode->ReparseDataSize = Size;
-    FileNode->ReparseData = ReparseData;
-    memcpy(FileNode->ReparseData, Buffer, Size);
-
-    return STATUS_SUCCESS;
-}
-
-static NTSTATUS DeleteReparsePoint(FSP_FILE_SYSTEM *FileSystem,
-    PVOID FileNode0,
-    PWSTR FileName, PVOID Buffer, SIZE_T Size)
-{
-    MEMFS_FILE_NODE *FileNode = (MEMFS_FILE_NODE *)FileNode0;
-    NTSTATUS Result;
-
-#if defined(MEMFS_NAMED_STREAMS)
-    if (0 != FileNode->MainFileNode)
-        FileNode = FileNode->MainFileNode;
-#endif
-
-    if (0 != FileNode->ReparseData)
-    {
-        Result = FspFileSystemCanReplaceReparsePoint(
-            FileNode->ReparseData, FileNode->ReparseDataSize,
-            Buffer, Size);
-        if (!NT_SUCCESS(Result))
-            return Result;
-    }
-    else
-        return STATUS_NOT_A_REPARSE_POINT;
-
-    free(FileNode->ReparseData);
-
-    FileNode->FileInfo.FileAttributes &= ~FILE_ATTRIBUTE_REPARSE_POINT;
-    FileNode->FileInfo.ReparseTag = 0;
-    FileNode->ReparseDataSize = 0;
-    FileNode->ReparseData = 0;
-
-    return STATUS_SUCCESS;
-}
-
-#if defined(MEMFS_NAMED_STREAMS)
-typedef struct _MEMFS_GET_STREAM_INFO_CONTEXT
-{
-    PVOID Buffer;
-    ULONG Length;
-    PULONG PBytesTransferred;
-} MEMFS_GET_STREAM_INFO_CONTEXT;
-
-static BOOLEAN AddStreamInfo(MEMFS_FILE_NODE *FileNode,
-    PVOID Buffer, ULONG Length, PULONG PBytesTransferred)
-{
-    UINT8 StreamInfoBuf[sizeof(FSP_FSCTL_STREAM_INFO) + sizeof FileNode->FileName];
-    FSP_FSCTL_STREAM_INFO *StreamInfo = (FSP_FSCTL_STREAM_INFO *)StreamInfoBuf;
-    PWSTR StreamName;
-
-    StreamName = wcschr(FileNode->FileName, L':');
-    if (0 != StreamName)
-        StreamName++;
-    else
-        StreamName = L"";
-
-    StreamInfo->Size = (UINT16)(sizeof(FSP_FSCTL_STREAM_INFO) + wcslen(StreamName) * sizeof(WCHAR));
-    StreamInfo->StreamSize = FileNode->FileInfo.FileSize;
-    StreamInfo->StreamAllocationSize = FileNode->FileInfo.AllocationSize;
-    memcpy(StreamInfo->StreamNameBuf, StreamName, StreamInfo->Size - sizeof(FSP_FSCTL_STREAM_INFO));
-
-    return FspFileSystemAddStreamInfo(StreamInfo, Buffer, Length, PBytesTransferred);
-}
-
-static BOOLEAN GetStreamInfoEnumFn(MEMFS_FILE_NODE *FileNode, PVOID Context0)
-{
-    MEMFS_GET_STREAM_INFO_CONTEXT *Context = (MEMFS_GET_STREAM_INFO_CONTEXT *)Context0;
-
-    return AddStreamInfo(FileNode,
-        Context->Buffer, Context->Length, Context->PBytesTransferred);
-}
-
-static NTSTATUS GetStreamInfo(FSP_FILE_SYSTEM *FileSystem,
-    PVOID FileNode0, PVOID Buffer, ULONG Length,
-    PULONG PBytesTransferred)
-{
-    MEMFS *Memfs = (MEMFS *)FileSystem->UserContext;
-    MEMFS_FILE_NODE *FileNode = (MEMFS_FILE_NODE *)FileNode0;
-    MEMFS_GET_STREAM_INFO_CONTEXT Context;
-
-    if (0 != FileNode->MainFileNode)
-        FileNode = FileNode->MainFileNode;
-
-    Context.Buffer = Buffer;
-    Context.Length = Length;
-    Context.PBytesTransferred = PBytesTransferred;
-
-    if (0 == (FileNode->FileInfo.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
-        !AddStreamInfo(FileNode, Buffer, Length, PBytesTransferred))
-        return STATUS_SUCCESS;
-
-    if (MemfsFileNodeMapEnumerateNamedStreams(Memfs->FileNodeMap, FileNode, GetStreamInfoEnumFn, &Context))
-        FspFileSystemAddStreamInfo(0, Buffer, Length, PBytesTransferred);
-
-    /* ???: how to handle out of response buffer condition? */
-
-    return STATUS_SUCCESS;
+    return STATUS_INVALID_DEVICE_REQUEST;
 }
 #endif
 
-static FSP_FILE_SYSTEM_INTERFACE MemfsInterface =
+#if 0
+NTSTATUS DOKAN_CALLBACK MyLockFile(LPCWSTR FileName,
+    LONGLONG ByteOffset,
+    LONGLONG Length,
+    PDOKAN_FILE_INFO DokanFileInfo)
 {
-    GetVolumeInfo,
-    SetVolumeLabel,
-    GetSecurityByName,
-    Create,
-    Open,
-    Overwrite,
-    Cleanup,
-    Close,
-    Read,
-    Write,
-    Flush,
-    GetFileInfo,
-    SetBasicInfo,
-    SetFileSize,
-    CanDelete,
-    Rename,
-    GetSecurity,
-    SetSecurity,
-    ReadDirectory,
-    ResolveReparsePoints,
-    GetReparsePoint,
-    SetReparsePoint,
-    DeleteReparsePoint,
+    return STATUS_INVALID_DEVICE_REQUEST;
+}
+#endif
+
+#if 0
+NTSTATUS DOKAN_CALLBACK MyUnlockFile(LPCWSTR FileName,
+    LONGLONG ByteOffset,
+    LONGLONG Length,
+    PDOKAN_FILE_INFO DokanFileInfo)
+{
+    return STATUS_INVALID_DEVICE_REQUEST;
+}
+#endif
+
+#if 0
+NTSTATUS DOKAN_CALLBACK MyMounted(PDOKAN_FILE_INFO DokanFileInfo)
+{
+    return STATUS_INVALID_DEVICE_REQUEST;
+}
+#endif
+
+#if 0
+NTSTATUS DOKAN_CALLBACK MyUnmounted(PDOKAN_FILE_INFO DokanFileInfo)
+{
+    return STATUS_INVALID_DEVICE_REQUEST;
+}
+#endif
+
+#if 0
+NTSTATUS DOKAN_CALLBACK MyGetFileSecurity(LPCWSTR FileName,
+    PSECURITY_INFORMATION SecurityInformation,
+    PSECURITY_DESCRIPTOR SecurityDescriptor,
+    ULONG BufferLength,
+    PULONG LengthNeeded,
+    PDOKAN_FILE_INFO DokanFileInfo)
+{
+    return STATUS_INVALID_DEVICE_REQUEST;
+}
+#endif
+
+#if 0
+NTSTATUS DOKAN_CALLBACK MySetFileSecurity(LPCWSTR FileName,
+    PSECURITY_INFORMATION SecurityInformation,
+    PSECURITY_DESCRIPTOR SecurityDescriptor,
+    ULONG BufferLength,
+    PDOKAN_FILE_INFO DokanFileInfo)
+{
+    return STATUS_INVALID_DEVICE_REQUEST;
+}
+#endif
+
+#if 0
+NTSTATUS DOKAN_CALLBACK MyFindStreams(LPCWSTR FileName,
+    PFillFindStreamData FillFindStreamData,
+    PDOKAN_FILE_INFO DokanFileInfo)
+{
+    return STATUS_INVALID_DEVICE_REQUEST;
+}
+#endif
+
+static DOKAN_OPERATIONS MyOperations =
+{
+    MyCreateFile,
+    MyCleanup,
+    MyCloseFile,
+    MyReadFile,
+    MyWriteFile,
+    MyFlushFileBuffers,
+    MyGetFileInformation,
+    MyFindFiles,
+    0, //MyFindFilesWithPattern,
+    MySetFileAttributes,
+    MySetFileTime,
+    MyDeleteFile,
+    MyDeleteDirectory,
+    MyMoveFile,
+    MySetEndOfFile,
+    MySetAllocationSize,
+    0,//MyLockFile,
+    0,//MyUnlockFile,
+    MyGetDiskFreeSpace,
+    MyGetVolumeInformation,
+    0,//MyMounted,
+    0,//MyUnmounted,
+    0,//MyGetFileSecurity,
+    0,//MySetFileSecurity,
 #if defined(MEMFS_NAMED_STREAMS)
-    GetStreamInfo,
+    0,//MyFindStreams,
 #else
     0,
 #endif
 };
+
+NTSTATUS MemfsMain(PWSTR Mountpoint, PWSTR UncName)
+{
+    MEMFS *Memfs = 0;
+    DWORD_PTR ProcessMask, SystemMask;
+    DOKAN_OPTIONS Options;
+    NTSTATUS Result;
+    int MainResult;
+
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &ProcessMask, &SystemMask))
+        return STATUS_UNSUCCESSFUL;
+
+    memset(&Options, 0, sizeof Options);
+    Options.Version = DOKAN_VERSION;
+    for (Options.ThreadCount = 0; 0 != ProcessMask; ProcessMask >>= 1)
+        Options.ThreadCount += ProcessMask & 1;
+    if (Options.ThreadCount < 2)
+        Options.ThreadCount = 2;
+    Options.GlobalContext = (UINT_PTR)Memfs;
+    Options.MountPoint = Mountpoint;
+    Options.UNCName = UncName;
+    Options.Timeout = 60000;
+    Options.AllocationUnitSize = MEMFS_SECTOR_SIZE * MEMFS_SECTORS_PER_ALLOCATION_UNIT;
+    Options.SectorSize = MEMFS_SECTOR_SIZE;
+
+    MainResult = DokanMain(&Options, &MyOperations);
+    switch (MainResult)
+    {
+    case DOKAN_SUCCESS:
+        Result = STATUS_SUCCESS;
+        break;
+    case DOKAN_ERROR:
+    case DOKAN_DRIVE_LETTER_ERROR:
+    case DOKAN_DRIVER_INSTALL_ERROR:
+    case DOKAN_START_ERROR:
+    case DOKAN_MOUNT_ERROR:
+    case DOKAN_MOUNT_POINT_ERROR:
+    case DOKAN_VERSION_ERROR:
+        Result = 0xe0000000 | (-MainResult);
+        break;
+    default:
+        Result = STATUS_UNSUCCESSFUL;
+        break;
+    }
+
+    return Result;
+}
+
+#if 0
 
 NTSTATUS MemfsCreate(
     ULONG Flags,

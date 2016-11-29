@@ -15,12 +15,15 @@
 #ifndef MEMFS_DOKANY_H_INCLUDED
 #define MEMFS_DOKANY_H_INCLUDED
 
-#if 0
-#include <winfsp/winfsp.h>
+#include <dokan/dokan.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+#define FSP_FSCTL_ALIGN_UP(x, s)        (((x) + ((s) - 1L)) & ~((s) - 1L))
+
+#if 0
 
 typedef struct _MEMFS MEMFS;
 
@@ -46,10 +49,10 @@ FSP_FILE_SYSTEM *MemfsFileSystem(MEMFS *Memfs);
 
 NTSTATUS MemfsHeapConfigure(SIZE_T InitialSize, SIZE_T MaximumSize, SIZE_T Alignment);
 
+#endif //#if 0
+
 #ifdef __cplusplus
 }
 #endif
-
-#endif //#if 0
 
 #endif
