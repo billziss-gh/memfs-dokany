@@ -1406,7 +1406,7 @@ VOID MemfsDelete(MEMFS *Memfs)
     free(Memfs);
 }
 
-NTSTATUS MemfsRun(MEMFS *Memfs, PWSTR Mountpoint, PWSTR UncName)
+NTSTATUS MemfsRun(MEMFS *Memfs, PWSTR MountPoint, PWSTR UncName)
 {
     DWORD_PTR ProcessMask, SystemMask;
     DOKAN_OPTIONS Options;
@@ -1426,7 +1426,7 @@ NTSTATUS MemfsRun(MEMFS *Memfs, PWSTR Mountpoint, PWSTR UncName)
     if (Options.ThreadCount < 2)
         Options.ThreadCount = 2;
     Options.GlobalContext = (UINT_PTR)Memfs;
-    Options.MountPoint = Mountpoint;
+    Options.MountPoint = MountPoint;
     Options.UNCName = 0;//UncName;
     Options.Timeout = 600000;
     Options.AllocationUnitSize = MEMFS_SECTOR_SIZE * MEMFS_SECTORS_PER_ALLOCATION_UNIT;
@@ -1460,4 +1460,140 @@ NTSTATUS MemfsHeapConfigure(SIZE_T InitialSize, SIZE_T MaximumSize, SIZE_T Align
 {
     return LargeHeapInitialize(0, InitialSize, MaximumSize, LargeHeapAlignment) ?
         STATUS_SUCCESS : STATUS_INSUFFICIENT_RESOURCES;
+}
+
+/*
+ * Main
+ */
+
+#define PROGNAME                        "memfs-dokany"
+
+static void vwarn(const char *format, va_list ap)
+{
+    char buf[1024];
+        /* wvsprintf is only safe with a 1024 byte buffer */
+    DWORD BytesTransferred;
+
+    wvsprintfA(buf, format, ap);
+    buf[sizeof buf - 1] = '\0';
+
+    WriteFile(GetStdHandle(STD_ERROR_HANDLE),
+        buf, (DWORD)strlen(buf),
+        &BytesTransferred, 0);
+    WriteFile(GetStdHandle(STD_ERROR_HANDLE),
+        "\n", 1,
+        &BytesTransferred, 0);
+}
+
+static void warn(const char *format, ...)
+{
+    va_list ap;
+
+    va_start(ap, format);
+    vwarn(format, ap);
+    va_end(ap);
+}
+
+static void fail(const char *format, ...)
+{
+    va_list ap;
+
+    va_start(ap, format);
+    vwarn(format, ap);
+    va_end(ap);
+
+    exit(1);
+}
+
+static void usage(void)
+{
+    static char usage[] = ""
+        "usage: %s OPTIONS\n"
+        "\n"
+        "options:\n"
+        "    -n MaxFileNodes\n"
+        "    -s MaxFileSize      [bytes]\n"
+        "    -m MountPoint       [X:]\n";
+
+    warn(usage, PROGNAME);
+    exit(2);
+}
+
+static ULONG argtol(wchar_t **argp, ULONG deflt)
+{
+    if (0 == argp[0])
+        usage();
+
+    wchar_t *endp;
+    ULONG ul = wcstol(argp[0], &endp, 10);
+    return L'\0' != argp[0][0] && L'\0' == *endp ? ul : deflt;
+}
+
+static wchar_t *argtos(wchar_t **argp)
+{
+    if (0 == argp[0])
+        usage();
+
+    return argp[0];
+}
+
+static PWSTR MountPoint;
+
+static BOOL WINAPI ConsoleCtrlHandler(DWORD CtrlType)
+{
+    DokanRemoveMountPoint(MountPoint);
+    return TRUE;
+}
+
+int wmain(int argc, wchar_t **argv)
+{
+    wchar_t **argp;
+    NTSTATUS Result;
+    MEMFS *Memfs;
+    ULONG Flags = 0;
+    ULONG MaxFileNodes = 1024;
+    ULONG MaxFileSize = 16 * 1024 * 1024;
+
+    for (argp = argv + 1; 0 != argp[0]; argp++)
+    {
+        if (L'-' != argp[0][0])
+            break;
+        switch (argp[0][1])
+        {
+        case L'?':
+            usage();
+            break;
+        case L'm':
+            MountPoint = argtos(++argp);
+            break;
+        case L'n':
+            MaxFileNodes = argtol(++argp, MaxFileNodes);
+            break;
+        case L's':
+            MaxFileSize = argtol(++argp, MaxFileSize);
+            break;
+        default:
+            usage();
+            break;
+        }
+    }
+
+    if (0 != argp[0])
+        usage();
+
+    Result = MemfsCreate(Flags, MaxFileNodes, MaxFileSize, &Memfs);
+    if (!NT_SUCCESS(Result))
+        fail("error: cannot create MEMFS: Status=%#lx", Result);
+
+    warn("%s --n %ld -s %ld% -m %S",
+        PROGNAME, MaxFileNodes, MaxFileSize, MountPoint);
+    SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
+
+    Result = MemfsRun(Memfs, MountPoint, 0/*unused*/);
+    if (!NT_SUCCESS(Result))
+        fail("error: cannot run MEMFS: Status=%lx", Result);
+
+    MemfsDelete(Memfs);
+
+    return 0;
 }
