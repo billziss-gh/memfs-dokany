@@ -233,8 +233,6 @@ typedef struct _MEMFS
     MEMFS_FILE_NODE_MAP *FileNodeMap;
     ULONG MaxFileNodes;
     ULONG MaxFileSize;
-    UINT16 VolumeLabelLength;
-    WCHAR VolumeLabel[32];
 } MEMFS;
 
 static inline
@@ -534,7 +532,7 @@ NTSTATUS DOKAN_CALLBACK MyGetVolumeInformation(LPWSTR VolumeNameBuffer,
     *VolumeSerialNumber = 0;
     *MaximumComponentLength = 255;
     *FileSystemFlags =
-        FILE_CASE_SENSITIVE_SEARCH |
+        (MemfsFileNodeMapIsCaseInsensitive(Memfs->FileNodeMap) ? FILE_CASE_SENSITIVE_SEARCH : 0) |
         FILE_CASE_PRESERVED_NAMES |
         FILE_UNICODE_ON_DISK;
     FileSystemNameBuffer[0] = L'\0';
@@ -1342,16 +1340,84 @@ static DOKAN_OPERATIONS MyOperations =
 #endif
 };
 
-NTSTATUS MemfsMain(PWSTR Mountpoint, PWSTR UncName)
+NTSTATUS MemfsCreate(
+    ULONG Flags,
+    ULONG MaxFileNodes,
+    ULONG MaxFileSize,
+    MEMFS **PMemfs)
 {
-    MEMFS *Memfs = 0;
+    NTSTATUS Result;
+    BOOLEAN CaseInsensitive = !!(Flags & MemfsCaseInsensitive);
+    UINT64 AllocationUnit;
+    MEMFS *Memfs;
+    MEMFS_FILE_NODE *RootNode;
+    BOOLEAN Inserted;
+
+    *PMemfs = 0;
+
+    Result = MemfsHeapConfigure(0, 0, 0);
+    if (!NT_SUCCESS(Result))
+        return Result;
+
+    Memfs = (MEMFS *)malloc(sizeof *Memfs);
+    if (0 == Memfs)
+        return STATUS_INSUFFICIENT_RESOURCES;
+
+    memset(Memfs, 0, sizeof *Memfs);
+    Memfs->MaxFileNodes = MaxFileNodes;
+    AllocationUnit = MEMFS_SECTOR_SIZE * MEMFS_SECTORS_PER_ALLOCATION_UNIT;
+    Memfs->MaxFileSize = (ULONG)((MaxFileSize + AllocationUnit - 1) / AllocationUnit * AllocationUnit);
+
+    Result = MemfsFileNodeMapCreate(CaseInsensitive, &Memfs->FileNodeMap);
+    if (!NT_SUCCESS(Result))
+    {
+        free(Memfs);
+        return Result;
+    }
+
+    /*
+     * Create root directory.
+     */
+
+    Result = MemfsFileNodeCreate(L"\\", &RootNode);
+    if (!NT_SUCCESS(Result))
+    {
+        MemfsDelete(Memfs);
+        return Result;
+    }
+
+    RootNode->FileInfo.dwFileAttributes = FILE_ATTRIBUTE_DIRECTORY;
+
+    Result = MemfsFileNodeMapInsert(Memfs->FileNodeMap, RootNode, &Inserted);
+    if (!NT_SUCCESS(Result))
+    {
+        MemfsFileNodeDelete(RootNode);
+        MemfsDelete(Memfs);
+        return Result;
+    }
+
+    return STATUS_SUCCESS;
+}
+
+VOID MemfsDelete(MEMFS *Memfs)
+{
+    MemfsFileNodeMapDelete(Memfs->FileNodeMap);
+
+    free(Memfs);
+}
+
+NTSTATUS MemfsRun(MEMFS *Memfs, PWSTR Mountpoint, PWSTR UncName)
+{
     DWORD_PTR ProcessMask, SystemMask;
     DOKAN_OPTIONS Options;
     NTSTATUS Result;
     int MainResult;
 
     if (!GetProcessAffinityMask(GetCurrentProcess(), &ProcessMask, &SystemMask))
-        return STATUS_UNSUCCESSFUL;
+    {
+        Result = STATUS_UNSUCCESSFUL;
+        goto exit;
+    }
 
     memset(&Options, 0, sizeof Options);
     Options.Version = DOKAN_VERSION;
@@ -1386,165 +1452,8 @@ NTSTATUS MemfsMain(PWSTR Mountpoint, PWSTR UncName)
         break;
     }
 
+exit:
     return Result;
-}
-
-#if 0
-
-NTSTATUS MemfsCreate(
-    ULONG Flags,
-    ULONG FileInfoTimeout,
-    ULONG MaxFileNodes,
-    ULONG MaxFileSize,
-    PWSTR VolumePrefix,
-    PWSTR RootSddl,
-    MEMFS **PMemfs)
-{
-    NTSTATUS Result;
-    FSP_FSCTL_VOLUME_PARAMS VolumeParams;
-    BOOLEAN CaseInsensitive = !!(Flags & MemfsCaseInsensitive);
-    PWSTR DevicePath = (Flags & MemfsNet) ?
-        L"" FSP_FSCTL_NET_DEVICE_NAME : L"" FSP_FSCTL_DISK_DEVICE_NAME;
-    UINT64 AllocationUnit;
-    MEMFS *Memfs;
-    MEMFS_FILE_NODE *RootNode;
-    PSECURITY_DESCRIPTOR RootSecurity;
-    ULONG RootSecuritySize;
-    BOOLEAN Inserted;
-
-    *PMemfs = 0;
-
-    Result = MemfsHeapConfigure(0, 0, 0);
-    if (!NT_SUCCESS(Result))
-        return Result;
-
-    if (0 == RootSddl)
-        RootSddl = L"O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)";
-    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(RootSddl, SDDL_REVISION_1,
-        &RootSecurity, &RootSecuritySize))
-        return FspNtStatusFromWin32(GetLastError());
-
-    Memfs = (MEMFS *)malloc(sizeof *Memfs);
-    if (0 == Memfs)
-    {
-        LocalFree(RootSecurity);
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-
-    memset(Memfs, 0, sizeof *Memfs);
-    Memfs->MaxFileNodes = MaxFileNodes;
-    AllocationUnit = MEMFS_SECTOR_SIZE * MEMFS_SECTORS_PER_ALLOCATION_UNIT;
-    Memfs->MaxFileSize = (ULONG)((MaxFileSize + AllocationUnit - 1) / AllocationUnit * AllocationUnit);
-
-    Result = MemfsFileNodeMapCreate(CaseInsensitive, &Memfs->FileNodeMap);
-    if (!NT_SUCCESS(Result))
-    {
-        free(Memfs);
-        LocalFree(RootSecurity);
-        return Result;
-    }
-
-    memset(&VolumeParams, 0, sizeof VolumeParams);
-    VolumeParams.SectorSize = MEMFS_SECTOR_SIZE;
-    VolumeParams.SectorsPerAllocationUnit = MEMFS_SECTORS_PER_ALLOCATION_UNIT;
-    VolumeParams.VolumeCreationTime = MemfsGetSystemTime();
-    VolumeParams.VolumeSerialNumber = (UINT32)(MemfsGetSystemTime() / (10000 * 1000));
-    VolumeParams.FileInfoTimeout = FileInfoTimeout;
-    VolumeParams.CaseSensitiveSearch = !CaseInsensitive;
-    VolumeParams.CasePreservedNames = 1;
-    VolumeParams.UnicodeOnDisk = 1;
-    VolumeParams.PersistentAcls = 1;
-    VolumeParams.ReparsePoints = 1;
-    VolumeParams.ReparsePointsAccessCheck = 0;
-#if defined(MEMFS_NAMED_STREAMS)
-    VolumeParams.NamedStreams = 1;
-#endif
-    VolumeParams.PostCleanupOnDeleteOnly = 1;
-    if (0 != VolumePrefix)
-        wcscpy_s(VolumeParams.Prefix, sizeof VolumeParams.Prefix / sizeof(WCHAR), VolumePrefix);
-    wcscpy_s(VolumeParams.FileSystemName, sizeof VolumeParams.FileSystemName / sizeof(WCHAR), L"MEMFS");
-
-    Result = FspFileSystemCreate(DevicePath, &VolumeParams, &MemfsInterface, &Memfs->FileSystem);
-    if (!NT_SUCCESS(Result))
-    {
-        MemfsFileNodeMapDelete(Memfs->FileNodeMap);
-        free(Memfs);
-        LocalFree(RootSecurity);
-        return Result;
-    }
-
-    Memfs->FileSystem->UserContext = Memfs;
-    Memfs->VolumeLabelLength = sizeof L"MEMFS" - sizeof(WCHAR);
-    memcpy(Memfs->VolumeLabel, L"MEMFS", Memfs->VolumeLabelLength);
-
-#if 0
-    FspFileSystemSetOperationGuardStrategy(Memfs->FileSystem,
-        FSP_FILE_SYSTEM_OPERATION_GUARD_STRATEGY_COARSE);
-#endif
-
-    /*
-     * Create root directory.
-     */
-
-    Result = MemfsFileNodeCreate(L"\\", &RootNode);
-    if (!NT_SUCCESS(Result))
-    {
-        MemfsDelete(Memfs);
-        LocalFree(RootSecurity);
-        return Result;
-    }
-
-    RootNode->FileInfo.FileAttributes = FILE_ATTRIBUTE_DIRECTORY;
-
-    RootNode->FileSecurity = malloc(RootSecuritySize);
-    if (0 == RootNode->FileSecurity)
-    {
-        MemfsFileNodeDelete(RootNode);
-        MemfsDelete(Memfs);
-        LocalFree(RootSecurity);
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-    RootNode->FileSecuritySize = RootSecuritySize;
-    memcpy(RootNode->FileSecurity, RootSecurity, RootSecuritySize);
-
-    Result = MemfsFileNodeMapInsert(Memfs->FileNodeMap, RootNode, &Inserted);
-    if (!NT_SUCCESS(Result))
-    {
-        MemfsFileNodeDelete(RootNode);
-        MemfsDelete(Memfs);
-        LocalFree(RootSecurity);
-        return Result;
-    }
-
-    LocalFree(RootSecurity);
-
-    *PMemfs = Memfs;
-
-    return STATUS_SUCCESS;
-}
-
-VOID MemfsDelete(MEMFS *Memfs)
-{
-    FspFileSystemDelete(Memfs->FileSystem);
-
-    MemfsFileNodeMapDelete(Memfs->FileNodeMap);
-
-    free(Memfs);
-}
-
-NTSTATUS MemfsStart(MEMFS *Memfs)
-{
-    return FspFileSystemStartDispatcher(Memfs->FileSystem, 0);
-}
-
-VOID MemfsStop(MEMFS *Memfs)
-{
-    FspFileSystemStopDispatcher(Memfs->FileSystem);
-}
-
-FSP_FILE_SYSTEM *MemfsFileSystem(MEMFS *Memfs)
-{
-    return Memfs->FileSystem;
 }
 
 NTSTATUS MemfsHeapConfigure(SIZE_T InitialSize, SIZE_T MaximumSize, SIZE_T Alignment)
@@ -1552,4 +1461,3 @@ NTSTATUS MemfsHeapConfigure(SIZE_T InitialSize, SIZE_T MaximumSize, SIZE_T Align
     return LargeHeapInitialize(0, InitialSize, MaximumSize, LargeHeapAlignment) ?
         STATUS_SUCCESS : STATUS_INSUFFICIENT_RESOURCES;
 }
-#endif
