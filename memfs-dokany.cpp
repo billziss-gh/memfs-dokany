@@ -729,7 +729,7 @@ NTSTATUS DOKAN_CALLBACK MyCreateFile(LPCWSTR FileName0,
 
     NTSTATUS Result;
     WCHAR FileName[MAX_PATH];
-    PVOID FileNode;
+    PVOID FileNode = 0;
     BY_HANDLE_FILE_INFORMATION FileInfo;
 
     wcscpy_s(FileName, sizeof FileName / sizeof(WCHAR), FileName0);
